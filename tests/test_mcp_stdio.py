@@ -65,6 +65,16 @@ class MCPStdioTests(unittest.TestCase):
                     "fake": {
                         "command": [sys.executable, str(FAKE_AGENT), "{prompt}"],
                         "prompt_mode": "argument",
+                        "model": {"arguments": ["--model", "{model}"]},
+                        "reasoning_effort": {
+                            "arguments": ["--effort", "{reasoning_effort}"],
+                            "allowed_values": ["low", "high"],
+                        },
+                        "session": {
+                            "id_source": "generated_uuid",
+                            "start_arguments": ["--session-id", "{session_id}"],
+                            "resume_arguments": ["--resume", "{session_id}"],
+                        },
                     }
                 },
             }
@@ -113,7 +123,9 @@ class MCPStdioTests(unittest.TestCase):
                     {
                         "list_agents",
                         "reload_config",
+                        "start_child_agent",
                         "start_task",
+                        "send_followup",
                         "get_task",
                         "wait_task",
                         "list_tasks",
@@ -127,7 +139,7 @@ class MCPStdioTests(unittest.TestCase):
                         "id": 21,
                         "method": "tools/call",
                         "params": {
-                            "name": "start_task",
+                            "name": "start_child_agent",
                             "arguments": {
                                 "agent": "missing",
                                 "prompt": "x",
@@ -201,6 +213,17 @@ class MCPStdioTests(unittest.TestCase):
                     {agent["alias"] for agent in still_loaded["agents"]},
                     {"fake", "second"},
                 )
+                self.assertFalse(still_loaded["native_codex_subagents"])
+                fake_capabilities = next(
+                    agent for agent in still_loaded["agents"] if agent["alias"] == "fake"
+                )
+                self.assertEqual(fake_capabilities["task_kind"], "external_child_agent")
+                self.assertTrue(fake_capabilities["model"]["supported"])
+                self.assertEqual(
+                    fake_capabilities["reasoning_effort"]["allowed_values"],
+                    ["low", "high"],
+                )
+                self.assertTrue(fake_capabilities["supports_followup"])
                 unknown_method = self.send(
                     process,
                     {"jsonrpc": "2.0", "id": 23, "method": "unknown/method"},
@@ -219,6 +242,8 @@ class MCPStdioTests(unittest.TestCase):
                                     "agent": "fake",
                                     "prompt": "roundtrip-result",
                                     "cwd": str(work),
+                                    "model": "test-model",
+                                    "reasoning_effort": "high",
                                 },
                             },
                         },
@@ -240,6 +265,45 @@ class MCPStdioTests(unittest.TestCase):
                 )
                 self.assertEqual(completed["status"], "succeeded")
                 self.assertEqual(completed["stdout"]["text"], "roundtrip-result")
+                self.assertEqual(completed["task_kind"], "external_child_agent")
+                self.assertEqual(completed["model"], "test-model")
+                self.assertEqual(completed["reasoning_effort"], "high")
+                followup = self.tool_payload(
+                    self.send(
+                        process,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 5,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "send_followup",
+                                "arguments": {
+                                    "parent_task_id": completed["task_id"],
+                                    "prompt": "followup-result",
+                                },
+                            },
+                        },
+                    )
+                )
+                followed = self.tool_payload(
+                    self.send(
+                        process,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 6,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "wait_task",
+                                "arguments": {"task_id": followup["task_id"], "wait_sec": 5},
+                            },
+                        },
+                    )
+                )
+                self.assertEqual(followed["status"], "succeeded")
+                self.assertEqual(followed["stdout"]["text"], "followup-result")
+                self.assertEqual(followed["parent_task_id"], completed["task_id"])
+                self.assertEqual(followed["root_task_id"], completed["task_id"])
+                self.assertEqual(followed["session_id"], completed["session_id"])
             finally:
                 if process.stdin is not None:
                     process.stdin.close()

@@ -26,7 +26,10 @@ TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MAX_PROMPT_BYTES = 1024 * 1024
 MAX_EXTRA_ARGUMENTS = 64
 MAX_EXTRA_ARGUMENT_BYTES = 4096
+MAX_SELECTOR_BYTES = 256
+MAX_SESSION_ID_BYTES = 1024
 PLACEHOLDER_PATTERN = re.compile(r"\{(?:prompt|prompt_file|cwd|task_id)\}")
+_UNSET = object()
 
 
 # ==========================================
@@ -142,6 +145,13 @@ class TaskRecord:
     created_at: str
     timeout_sec: int
     max_output_bytes: int
+    task_kind: str = "external_child_agent"
+    invocation: str = "start"
+    parent_task_id: str | None = None
+    root_task_id: str | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    session_id: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     return_code: int | None = None
@@ -213,7 +223,14 @@ class TaskManager:
         return {
             "schema_version": 1,
             "task_id": record.task_id,
+            "task_kind": record.task_kind,
             "agent": record.agent,
+            "invocation": record.invocation,
+            "parent_task_id": record.parent_task_id,
+            "root_task_id": record.root_task_id or record.task_id,
+            "model": record.model,
+            "reasoning_effort": record.reasoning_effort,
+            "session_id": record.session_id,
             "status": record.status,
             "cwd": record.cwd,
             "command": record.command,
@@ -256,6 +273,27 @@ class TaskManager:
             raise ValueError("invalid task limit metadata")
         if value["status"] not in TERMINAL_STATUSES | RECOVERABLE_STATUSES:
             raise ValueError("invalid task status metadata")
+        task_kind = value.get("task_kind", "external_child_agent")
+        invocation = value.get("invocation", "start")
+        if task_kind != "external_child_agent" or invocation not in {"start", "followup"}:
+            raise ValueError("invalid external child-agent metadata")
+        optional_ids = ("parent_task_id", "root_task_id")
+        for key in optional_ids:
+            item = value.get(key)
+            if item is not None and (
+                not isinstance(item, str) or TASK_ID_PATTERN.fullmatch(item) is None
+            ):
+                raise ValueError(f"invalid {key} metadata")
+        for key in ("model", "reasoning_effort", "session_id"):
+            item = value.get(key)
+            maximum = MAX_SESSION_ID_BYTES if key == "session_id" else MAX_SELECTOR_BYTES
+            if item is not None and (
+                not isinstance(item, str)
+                or not item
+                or "\0" in item
+                or len(item.encode("utf-8")) > maximum
+            ):
+                raise ValueError(f"invalid {key} metadata")
         return TaskRecord(
             task_id=value["task_id"],
             agent=value["agent"],
@@ -265,6 +303,13 @@ class TaskManager:
             created_at=value["created_at"],
             timeout_sec=timeout_sec,
             max_output_bytes=max_output_bytes,
+            task_kind=task_kind,
+            invocation=invocation,
+            parent_task_id=value.get("parent_task_id"),
+            root_task_id=value.get("root_task_id") or value["task_id"],
+            model=value.get("model"),
+            reasoning_effort=value.get("reasoning_effort"),
+            session_id=value.get("session_id"),
             started_at=value.get("started_at") if isinstance(value.get("started_at"), str) else None,
             finished_at=value.get("finished_at") if isinstance(value.get("finished_at"), str) else None,
             return_code=value.get("return_code") if isinstance(value.get("return_code"), int) else None,
@@ -383,8 +428,98 @@ class TaskManager:
             raise TaskError(f"configured executable was not found on PATH: {executable}")
 
     # ==========================================
-    # Function: Start one configured external-agent task asynchronously.
-    # Method: Validate policy, create private state, snapshot redacted argv, and launch a worker thread.
+    # Function: Resolve one optional model or reasoning selector.
+    # Method: Apply the configured default, enforce the allowlist, and expand provider argv once.
+    # ==========================================
+    def _selection_arguments(
+        self,
+        agent: AgentConfig,
+        field_name: str,
+        requested: Any,
+    ) -> tuple[str | None, list[str]]:
+        mapping = getattr(agent, field_name)
+        if requested is not None and (
+            not isinstance(requested, str)
+            or not requested
+            or "\0" in requested
+            or len(requested.encode("utf-8")) > MAX_SELECTOR_BYTES
+        ):
+            raise TaskError(
+                f"{field_name} must be null or a non-empty NUL-free string up to "
+                f"{MAX_SELECTOR_BYTES} bytes"
+            )
+        if mapping is None:
+            if requested is not None:
+                raise TaskError(f"agent {agent.alias!r} does not configure {field_name} selection")
+            return None, []
+        selected = mapping.default if requested is None else requested
+        if selected is None:
+            return None, []
+        if mapping.allowed_values is not None and selected not in mapping.allowed_values:
+            raise TaskError(
+                f"{field_name} for agent {agent.alias!r} must be one of "
+                f"{list(mapping.allowed_values)}"
+            )
+        placeholder = "{model}" if field_name == "model" else "{reasoning_effort}"
+        arguments = [
+            re.sub(re.escape(placeholder), lambda _match: selected, argument)
+            for argument in mapping.arguments
+        ]
+        return selected, arguments
+
+    # ==========================================
+    # Function: Expand provider session arguments for a new or resumed conversation.
+    # Method: Generate UUID sessions when configured and substitute exactly one session ID placeholder.
+    # ==========================================
+    def _session_arguments(
+        self,
+        agent: AgentConfig,
+        resume_session_id: str | None,
+    ) -> tuple[str | None, list[str]]:
+        session = agent.session
+        if resume_session_id is not None:
+            if (
+                not isinstance(resume_session_id, str)
+                or not resume_session_id
+                or "\0" in resume_session_id
+                or len(resume_session_id.encode("utf-8")) > MAX_SESSION_ID_BYTES
+            ):
+                raise TaskError("provider session ID is invalid")
+            if session is None:
+                raise TaskError(f"agent {agent.alias!r} does not configure resumable sessions")
+            session_id = resume_session_id
+            templates = session.resume_arguments
+        elif session is not None and session.id_source == "generated_uuid":
+            session_id = str(uuid.uuid4())
+            templates = session.start_arguments
+        elif session is not None:
+            session_id = None
+            templates = session.start_arguments
+        else:
+            return None, []
+        arguments = [
+            re.sub(re.escape("{session_id}"), lambda _match: session_id or "", argument)
+            for argument in templates
+        ]
+        return session_id, arguments
+
+    # ==========================================
+    # Function: Validate an optional parent task and derive the lineage root.
+    # Method: Require a known bridge task identifier and inherit its root task ID.
+    # ==========================================
+    def _lineage_root(self, parent_task_id: Any) -> str | None:
+        if parent_task_id is None:
+            return None
+        if not isinstance(parent_task_id, str) or TASK_ID_PATTERN.fullmatch(parent_task_id) is None:
+            raise TaskError("parent_task_id must be a valid string identifier")
+        parent = self._tasks.get(parent_task_id)
+        if parent is None:
+            raise TaskError(f"unknown parent_task_id {parent_task_id!r}")
+        return parent.root_task_id or parent.task_id
+
+    # ==========================================
+    # Function: Start one configured external child-agent task asynchronously.
+    # Method: Validate selectors and lineage, assemble direct argv, persist state, and launch a worker.
     # ==========================================
     def start_task(
         self,
@@ -393,6 +528,14 @@ class TaskManager:
         cwd: str,
         extra_args: Any = None,
         timeout_sec: int | None = None,
+        model: Any = None,
+        reasoning_effort: Any = None,
+        parent_task_id: Any = None,
+        *,
+        _resume_session_id: str | None = None,
+        _invocation: str = "start",
+        _effective_model: Any = _UNSET,
+        _effective_reasoning_effort: Any = _UNSET,
     ) -> dict[str, Any]:
         if not isinstance(prompt, str) or not prompt.strip():
             raise TaskError("prompt must be a non-empty string")
@@ -414,6 +557,27 @@ class TaskManager:
                 raise TaskError("maximum concurrent task limit reached")
             resolved_cwd = self._resolve_cwd(cwd)
             parsed_extra_args = self._validate_extra_args(extra_args, agent)
+            if _effective_model is _UNSET:
+                selected_model, model_arguments = self._selection_arguments(
+                    agent, "model", model
+                )
+            elif _effective_model is None:
+                selected_model, model_arguments = None, []
+            else:
+                selected_model, model_arguments = self._selection_arguments(
+                    agent, "model", _effective_model
+                )
+            if _effective_reasoning_effort is _UNSET:
+                selected_effort, effort_arguments = self._selection_arguments(
+                    agent, "reasoning_effort", reasoning_effort
+                )
+            elif _effective_reasoning_effort is None:
+                selected_effort, effort_arguments = None, []
+            else:
+                selected_effort, effort_arguments = self._selection_arguments(
+                    agent, "reasoning_effort", _effective_reasoning_effort
+                )
+            root_task_id = self._lineage_root(parent_task_id)
             effective_timeout = agent.timeout_sec if timeout_sec is None else timeout_sec
             if isinstance(effective_timeout, bool) or not isinstance(effective_timeout, int):
                 raise TaskError("timeout_sec must be an integer")
@@ -437,11 +601,34 @@ class TaskManager:
                 "{cwd}": str(resolved_cwd),
                 "{task_id}": task_id,
             }
-            command = [substitute(argument, replacements) for argument in agent.command]
+            session_id, session_arguments = self._session_arguments(
+                agent,
+                _resume_session_id,
+            )
+            base_command = [substitute(argument, replacements) for argument in agent.command]
+            insertion_index = next(
+                (
+                    index
+                    for index, argument in enumerate(agent.command)
+                    if "{prompt}" in argument or "{prompt_file}" in argument
+                ),
+                len(base_command),
+            )
+            control_arguments = model_arguments + effort_arguments + session_arguments
+            command = (
+                base_command[:insertion_index]
+                + control_arguments
+                + base_command[insertion_index:]
+            )
             command.extend(parsed_extra_args)
-            redacted_command = [
+            redacted_base_command = [
                 substitute(argument, redacted_replacements) for argument in agent.command
             ]
+            redacted_command = (
+                redacted_base_command[:insertion_index]
+                + control_arguments
+                + redacted_base_command[insertion_index:]
+            )
             redacted_command.extend("<extra-arg>" for _argument in parsed_extra_args)
             environment = self._build_environment(agent, replacements)
             self._validate_executable(command[0], resolved_cwd, environment)
@@ -463,6 +650,12 @@ class TaskManager:
                 created_at=utc_now(),
                 timeout_sec=effective_timeout,
                 max_output_bytes=agent.max_output_bytes,
+                invocation=_invocation,
+                parent_task_id=parent_task_id,
+                root_task_id=root_task_id or task_id,
+                model=selected_model,
+                reasoning_effort=selected_effort,
+                session_id=session_id,
             )
             self._tasks[task_id] = record
             try:
@@ -481,6 +674,57 @@ class TaskManager:
             worker.start()
             self._prune_history()
             return self._public_record(record)
+
+    # ==========================================
+    # Function: Resume one completed external child-agent conversation as a child task.
+    # Method: Enforce linear session use and inherit provider, cwd, selectors, limits, and lineage.
+    # ==========================================
+    def send_followup(
+        self,
+        parent_task_id: Any,
+        prompt: str,
+        extra_args: Any = None,
+        timeout_sec: int | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if not isinstance(parent_task_id, str) or TASK_ID_PATTERN.fullmatch(parent_task_id) is None:
+                raise TaskError("parent_task_id must be a valid string identifier")
+            parent = self._tasks.get(parent_task_id)
+            if parent is None:
+                raise TaskError(f"unknown parent_task_id {parent_task_id!r}")
+            if parent.status not in TERMINAL_STATUSES:
+                raise TaskError("follow-up requires a terminal parent task")
+            if parent.session_id is None:
+                raise TaskError("parent task has no resumable provider session ID")
+            agent = self._config.agents.get(parent.agent)
+            if agent is None or agent.session is None:
+                raise TaskError(
+                    f"agent {parent.agent!r} no longer configures resumable sessions"
+                )
+            same_session = [
+                record
+                for record in self._tasks.values()
+                if record.agent == parent.agent and record.session_id == parent.session_id
+            ]
+            if any(record.status in RECOVERABLE_STATUSES for record in same_session):
+                raise TaskError("provider session already has an active task")
+            latest = max(same_session, key=lambda record: (record.created_at, record.task_id))
+            if latest.task_id != parent.task_id:
+                raise TaskError(
+                    f"follow-up parent is stale; continue from latest task_id {latest.task_id!r}"
+                )
+            return self.start_task(
+                alias=parent.agent,
+                prompt=prompt,
+                cwd=parent.cwd,
+                extra_args=extra_args,
+                timeout_sec=parent.timeout_sec if timeout_sec is None else timeout_sec,
+                parent_task_id=parent.task_id,
+                _resume_session_id=parent.session_id,
+                _invocation="followup",
+                _effective_model=parent.model,
+                _effective_reasoning_effort=parent.reasoning_effort,
+            )
 
     # ==========================================
     # Function: Drain one child stream while enforcing its persisted byte ceiling.
@@ -599,8 +843,40 @@ class TaskManager:
         self._terminate_remaining_group(process.pid)
 
     # ==========================================
+    # Function: Extract a provider-generated session identifier from JSON stdout.
+    # Method: Traverse the configured object path and require one bounded non-empty string.
+    # ==========================================
+    def _extract_stdout_session_id(self, record: TaskRecord, agent: AgentConfig) -> str:
+        session = agent.session
+        if session is None or session.id_source != "stdout_json":
+            raise TaskError("agent does not configure stdout JSON session extraction")
+        stdout_path = self._task_dir(record.task_id) / "stdout.log"
+        try:
+            value: Any = json.loads(stdout_path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise TaskError(f"could not read provider JSON output: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise TaskError(
+                f"provider stdout is not valid JSON at line {exc.lineno}, column {exc.colno}"
+            ) from exc
+        for key in session.id_json_path:
+            if not isinstance(value, dict) or key not in value:
+                raise TaskError(
+                    f"provider JSON output is missing session path {list(session.id_json_path)!r}"
+                )
+            value = value[key]
+        if (
+            not isinstance(value, str)
+            or not value
+            or "\0" in value
+            or len(value.encode("utf-8")) > MAX_SESSION_ID_BYTES
+        ):
+            raise TaskError("provider session ID must be a non-empty NUL-free string up to 1024 bytes")
+        return value
+
+    # ==========================================
     # Function: Execute one task and transition it to exactly one terminal state.
-    # Method: Capture bounded streams concurrently, honor cancellation/timeout, and persist final metadata.
+    # Method: Capture bounded streams, extract provider sessions, honor cancellation, and persist state.
     # ==========================================
     def _run_task(
         self,
@@ -673,6 +949,19 @@ class TaskManager:
             self._terminate_remaining_group(process.pid)
             stdout_worker.join(timeout=5)
             stderr_worker.join(timeout=5)
+            session_error: str | None = None
+            if (
+                return_code == 0
+                and not timed_out
+                and not record.cancel_requested.is_set()
+                and record.session_id is None
+                and agent.session is not None
+                and agent.session.id_source == "stdout_json"
+            ):
+                try:
+                    record.session_id = self._extract_stdout_session_id(record, agent)
+                except TaskError as exc:
+                    session_error = str(exc)
 
             with self._lock:
                 record.return_code = return_code
@@ -682,6 +971,9 @@ class TaskManager:
                 elif timed_out:
                     record.status = "timed_out"
                     record.error = f"task exceeded timeout_sec={record.timeout_sec}"
+                elif session_error is not None:
+                    record.status = "failed"
+                    record.error = f"could not capture resumable provider session: {session_error}"
                 elif return_code == 0:
                     record.status = "succeeded"
                 else:
@@ -712,6 +1004,14 @@ class TaskManager:
         value.pop("schema_version", None)
         value.pop("pid", None)
         value.pop("process_start_ticks", None)
+        value["child_task_ids"] = [
+            item.task_id
+            for item in sorted(
+                self._tasks.values(),
+                key=lambda candidate: (candidate.created_at, candidate.task_id),
+            )
+            if item.parent_task_id == record.task_id
+        ]
         return value
 
     # ==========================================

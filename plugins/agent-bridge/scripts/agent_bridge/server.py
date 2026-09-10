@@ -11,7 +11,14 @@ import sys
 from typing import Any, Callable
 
 from . import __version__
-from .config import AgentConfig, BridgeConfig, ConfigError, load_active_config, load_config
+from .config import (
+    AgentConfig,
+    BridgeConfig,
+    ConfigError,
+    SelectionConfig,
+    load_active_config,
+    load_config,
+)
 from .tasks import TaskError, TaskManager
 
 
@@ -26,7 +33,10 @@ SUPPORTED_PROTOCOL_VERSIONS = {DEFAULT_PROTOCOL_VERSION}
 # ==========================================
 def tool_definitions() -> list[dict[str, Any]]:
     task_read_properties = {
-        "task_id": {"type": "string", "description": "Task identifier returned by start_task."},
+        "task_id": {
+            "type": "string",
+            "description": "External child-agent task identifier returned by a launch tool.",
+        },
         "stdout_offset": {
             "type": "integer",
             "minimum": 0,
@@ -47,6 +57,37 @@ def tool_definitions() -> list[dict[str, Any]]:
             "description": "Maximum bytes returned from each stream.",
         },
     }
+    launch_properties = {
+        "agent": {"type": "string", "description": "Configured external-agent alias."},
+        "prompt": {"type": "string", "description": "Task prompt sent through the configured mode."},
+        "cwd": {
+            "type": "string",
+            "description": "Explicit existing working directory for the external child agent.",
+        },
+        "model": {
+            "type": "string",
+            "description": "Optional model alias/name mapped through this agent's parameter configuration.",
+        },
+        "reasoning_effort": {
+            "type": "string",
+            "description": "Optional thinking/effort level mapped and validated by this agent alias.",
+        },
+        "parent_task_id": {
+            "type": "string",
+            "description": "Optional Agent Bridge parent task for external child-agent lineage only.",
+        },
+        "extra_args": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 64,
+            "description": "Optional discrete argv items when the alias allows them.",
+        },
+        "timeout_sec": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional timeout capped by the global configuration.",
+        },
+    }
     return [
         {
             "name": "list_agents",
@@ -59,36 +100,53 @@ def tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
-            "name": "start_task",
-            "description": "Start an asynchronous task in a configured external-agent CLI and return its task ID.",
+            "name": "start_child_agent",
+            "description": (
+                "Start a plugin-managed external child-agent task with optional model, "
+                "reasoning effort, and lineage, then return its task ID."
+            ),
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "agent": {"type": "string", "description": "Configured agent alias."},
-                    "prompt": {"type": "string", "description": "Task prompt sent through the configured mode."},
-                    "cwd": {
-                        "type": "string",
-                        "description": "Explicit existing working directory for the external agent.",
-                    },
-                    "extra_args": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "maxItems": 64,
-                        "description": "Optional discrete argv items when the alias allows them.",
-                    },
-                    "timeout_sec": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Optional timeout capped by the global configuration.",
-                    },
-                },
+                "properties": launch_properties,
                 "required": ["agent", "prompt", "cwd"],
                 "additionalProperties": False,
             },
         },
         {
+            "name": "start_task",
+            "description": (
+                "Backward-compatible alias of start_child_agent for launching an external CLI task."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": launch_properties,
+                "required": ["agent", "prompt", "cwd"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "send_followup",
+            "description": (
+                "Resume the latest terminal provider session as a new linked external child-agent task."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "parent_task_id": {
+                        "type": "string",
+                        "description": "Latest terminal task in the provider session to resume.",
+                    },
+                    "prompt": {"type": "string", "description": "Follow-up instruction."},
+                    "extra_args": launch_properties["extra_args"],
+                    "timeout_sec": launch_properties["timeout_sec"],
+                },
+                "required": ["parent_task_id", "prompt"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "get_task",
-            "description": "Read task metadata and paginated bounded stdout/stderr without waiting.",
+            "description": "Read external child-agent metadata, lineage, and paginated output without waiting.",
             "inputSchema": {
                 "type": "object",
                 "properties": task_read_properties,
@@ -117,7 +175,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "list_tasks",
-            "description": "List recent task metadata, optionally filtered by exact status names.",
+            "description": "List recent external child-agent task metadata and lineage.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -201,6 +259,18 @@ def validate_tool_arguments(
 
 
 # ==========================================
+# Function: Summarize one configured portable selector without exposing argv templates.
+# Method: Report override support, default value, and an optional exact allowlist.
+# ==========================================
+def selection_status(mapping: SelectionConfig | None) -> dict[str, Any]:
+    return {
+        "supported": mapping is not None,
+        "default": mapping.default if mapping is not None else None,
+        "allowed_values": list(mapping.allowed_values) if mapping and mapping.allowed_values else None,
+    }
+
+
+# ==========================================
 # Function: Report whether an alias executable is currently discoverable.
 # Method: Check direct absolute paths or PATH lookup without expanding task-specific placeholders.
 # ==========================================
@@ -276,6 +346,10 @@ class BridgeService:
                     "timeout_sec": agent.timeout_sec,
                     "max_output_bytes_per_stream": agent.max_output_bytes,
                     "allow_extra_args": agent.allow_extra_args,
+                    "task_kind": "external_child_agent",
+                    "model": selection_status(agent.model),
+                    "reasoning_effort": selection_status(agent.reasoning_effort),
+                    "supports_followup": agent.session is not None,
                     "executable": executable_status(agent),
                 }
             )
@@ -285,6 +359,7 @@ class BridgeService:
             "max_concurrent_tasks": config.max_concurrent_tasks,
             "max_retained_tasks": config.max_retained_tasks,
             "allowed_work_roots": [str(path) for path in config.allowed_work_roots],
+            "native_codex_subagents": False,
             "agents": agents,
         }
 
@@ -314,17 +389,40 @@ class BridgeService:
             if name == "reload_config":
                 validate_tool_arguments(arguments, set())
                 return tool_success(self.reload_config())
-            if name == "start_task":
+            if name in {"start_child_agent", "start_task"}:
                 validate_tool_arguments(
                     arguments,
                     {"agent", "prompt", "cwd"},
-                    {"extra_args", "timeout_sec"},
+                    {
+                        "extra_args",
+                        "timeout_sec",
+                        "model",
+                        "reasoning_effort",
+                        "parent_task_id",
+                    },
                 )
                 return tool_success(
                     self.manager.start_task(
                         alias=arguments.get("agent"),
                         prompt=arguments.get("prompt"),
                         cwd=arguments.get("cwd"),
+                        extra_args=arguments.get("extra_args"),
+                        timeout_sec=arguments.get("timeout_sec"),
+                        model=arguments.get("model"),
+                        reasoning_effort=arguments.get("reasoning_effort"),
+                        parent_task_id=arguments.get("parent_task_id"),
+                    )
+                )
+            if name == "send_followup":
+                validate_tool_arguments(
+                    arguments,
+                    {"parent_task_id", "prompt"},
+                    {"extra_args", "timeout_sec"},
+                )
+                return tool_success(
+                    self.manager.send_followup(
+                        parent_task_id=arguments.get("parent_task_id"),
+                        prompt=arguments.get("prompt"),
                         extra_args=arguments.get("extra_args"),
                         timeout_sec=arguments.get("timeout_sec"),
                     )

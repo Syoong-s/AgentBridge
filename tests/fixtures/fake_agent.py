@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -27,6 +28,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spawn-child", action="store_true")
     parser.add_argument("--child-pid-file")
     parser.add_argument("--early-output", default="")
+    parser.add_argument("--model")
+    parser.add_argument("--effort")
+    parser.add_argument("--session-id")
+    parser.add_argument("--resume")
+    parser.add_argument("--conversation")
+    parser.add_argument("--report-selection", action="store_true")
+    parser.add_argument("--emit-json-session", action="store_true")
     return parser.parse_args()
 
 
@@ -66,7 +74,29 @@ def main() -> int:
         sys.stderr.write(arguments.stderr)
     if arguments.environment:
         sys.stdout.write(os.environ.get(arguments.environment, "<missing>") + "|")
-    sys.stdout.write(prompt * arguments.repeat)
+    session_id = (
+        arguments.session_id
+        or arguments.resume
+        or arguments.conversation
+        or "fake-conversation-id"
+    )
+    if arguments.emit_json_session:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "conversation_id": session_id,
+                    "response": prompt * arguments.repeat,
+                    "model": arguments.model,
+                    "effort": arguments.effort,
+                }
+            )
+        )
+    else:
+        if arguments.report_selection:
+            sys.stdout.write(
+                f"model={arguments.model}|effort={arguments.effort}|session={session_id}|"
+            )
+        sys.stdout.write(prompt * arguments.repeat)
     sys.stdout.flush()
     return arguments.fail
 

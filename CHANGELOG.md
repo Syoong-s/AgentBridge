@@ -2,6 +2,14 @@
 
 All notable changes to AgentBridge are documented here.
 
+## 0.2.0 - 2026-09-10
+
+- Add first-class, alias-mapped model and reasoning-effort launch controls.
+- Add external child-agent identity, parent/root lineage, and visible child task IDs.
+- Add provider session capture plus safe linear follow-ups through `send_followup`.
+- Add official Claude Code (`claude`) and Google Antigravity CLI (`agy`) commands.
+- Keep `start_task` compatible while making `start_child_agent` the preferred launch tool.
+
 ## 0.1.0 - 2026-09-10
 
 - Add the installable `agent-bridge` Codex plugin and repo-local marketplace.

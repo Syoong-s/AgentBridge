@@ -1,7 +1,7 @@
 {
   "name": "agent-bridge",
-  "version": "0.1.0",
-  "description": "Launch configurable external agent CLIs from Codex and collect their task results through a local MCP bridge.",
+  "version": "0.2.0",
+  "description": "Launch configurable external agent CLIs as linked child tasks with model, reasoning, session, and result controls.",
   "author": {
     "name": "Syoong-s",
     "url": "https://github.com/Syoong-s"
@@ -23,8 +23,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Agent Bridge",
-    "shortDescription": "Run configured agent CLIs and collect results",
-    "longDescription": "Start asynchronous tasks in locally installed agent command-line tools such as Claude Code or Antigravity CLI, then inspect bounded output, wait for completion, or cancel work. Agent aliases and launch commands are controlled by a JSON parameter file.",
+    "shortDescription": "Orchestrate configured external agent CLIs",
+    "longDescription": "Start linked external child-agent tasks in locally installed command-line tools such as Claude Code or Antigravity CLI. Select provider models and reasoning effort, wait for bounded output, resume supported conversations, or cancel work through commands controlled by a JSON parameter file.",
     "developerName": "Syoong-s",
     "category": "Developer Tools",
     "capabilities": [

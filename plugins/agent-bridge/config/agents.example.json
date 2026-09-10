@@ -21,18 +21,79 @@
       ],
       "prompt_mode": "argument",
       "inherit_env": true,
-      "allow_extra_args": true
+      "allow_extra_args": true,
+      "model": {
+        "arguments": [
+          "--model",
+          "{model}"
+        ]
+      },
+      "reasoning_effort": {
+        "arguments": [
+          "--effort",
+          "{reasoning_effort}"
+        ],
+        "allowed_values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultracode"
+        ]
+      },
+      "session": {
+        "id_source": "generated_uuid",
+        "start_arguments": [
+          "--session-id",
+          "{session_id}"
+        ],
+        "resume_arguments": [
+          "--resume",
+          "{session_id}"
+        ]
+      }
     },
     "antigravity": {
       "enabled": false,
-      "description": "Template alias; update the command for the installed Antigravity CLI version before enabling",
+      "description": "Google Antigravity CLI in headless JSON mode (official executable: agy)",
       "command": [
-        "antigravity",
+        "agy",
+        "-p",
+        "--output-format",
+        "json",
         "{prompt}"
       ],
       "prompt_mode": "argument",
       "inherit_env": true,
-      "allow_extra_args": true
+      "allow_extra_args": true,
+      "model": {
+        "arguments": [
+          "--model",
+          "{model}"
+        ]
+      },
+      "reasoning_effort": {
+        "arguments": [
+          "--effort",
+          "{reasoning_effort}"
+        ],
+        "allowed_values": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "session": {
+        "id_source": "stdout_json",
+        "resume_arguments": [
+          "--conversation",
+          "{session_id}"
+        ],
+        "id_json_path": [
+          "conversation_id"
+        ]
+      }
     }
   }
 }

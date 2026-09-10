@@ -1,24 +1,29 @@
 # AgentBridge
 
-AgentBridge 是一个本地 Codex 插件：它可以通过用户配置的命令行 agent 启动任务，
-并把有大小上限的 stdout、stderr、退出状态和生命周期元数据返回给 Codex。
+AgentBridge 是一个本地 Codex 插件：它把用户配置的命令行 agent 作为插件托管的
+“外部子智能体”启动，并把有大小上限的 stdout、stderr、退出状态、父子关系和生命周期
+元数据返回给 Codex。
 
-仓库内置的 Claude Code 示例使用已经验证的非交互 `-p` 模式。Antigravity 以禁用
-模板提供，因为其具体参数应以本机所安装版本的帮助信息为准。其他 agent CLI 也可以
-通过新增 JSON 别名接入。
+内置别名使用当前官方文档中的 Claude Code 命令 `claude -p` 和 Google Antigravity
+CLI 命令 `agy -p`。Antigravity 默认保持禁用，避免未安装 `agy` 的机器无法使用回退
+配置；安装并认证后可直接启用。其他兼容 agent CLI 也可以通过新增 JSON 别名接入。
 
 ## 主要能力
 
 - 用 argv 数组直接启动进程，不隐式调用 shell；
 - agent 别名和启动指令完全由一个 JSON 参数文件控制；
+- 将统一的模型名和思考等级映射为每个 CLI 专属的 argv；
 - 支持参数、stdin、临时提示词文件三种传递模式；
 - 支持异步任务、有界等待、分页日志和持久化元数据；
+- 支持父任务/根任务关系、provider 会话续接和 follow-up；
 - 支持并发限制、超时、POSIX 进程组取消和服务重启恢复；
 - 支持工作目录白名单、别名级环境变量和额外参数策略；
 - 仅使用 Python 标准库，无需安装第三方包。
 
 AgentBridge 不是模型服务，也不会替其他 CLI 建立沙箱。外部 agent 使用该命令在本机
-已有的权限和认证状态运行。
+已有的权限和认证状态运行。“外部子智能体”是 AgentBridge 的编排抽象，不是 Codex
+原生子智能体线程：它不会进入原生子智能体 UI，也不会继承 Codex 原生模型、沙箱或
+线程设置。
 
 ## 环境要求
 
@@ -64,6 +69,9 @@ cp plugins/agent-bridge/config/agents.example.json \
 
 参数文件使用版本化 JSON。完整范例见
 [`plugins/agent-bridge/config/agents.example.json`](plugins/agent-bridge/config/agents.example.json)。
+内置命令依据 [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage)
+和 [Antigravity headless mode](https://antigravity.google/docs/cli/headless/)；实际运行前仍应
+用本机 `claude --help` 或 `agy --help` 核对已安装版本。
 
 全局参数：
 
@@ -89,11 +97,46 @@ cp plugins/agent-bridge/config/agents.example.json \
 | `timeout_sec` | 该别名的默认超时 |
 | `max_output_bytes` | 每个输出流的存储上限，1 KiB–100 MiB |
 | `allow_extra_args` | 是否允许在固定命令后附加独立的运行时 argv 项 |
+| `model` | 可选的统一模型选择器及其 provider argv 映射 |
+| `reasoning_effort` | 可选的统一思考/effort 选择器及其 provider argv 映射 |
+| `session` | 可选的 provider 会话创建、提取和续接协议 |
 
 支持 `{prompt}`、`{prompt_file}`、`{cwd}`、`{task_id}` 四种占位符。
 `argument` 模式必须恰好包含一个 `{prompt}`；`file` 模式必须恰好包含一个
 `{prompt_file}`，并在任务结束后删除私有临时文件；`stdin` 模式不能包含这两个提示词
 占位符。`command[0]` 不允许包含提示词占位符。
+
+### 模型名与思考等级
+
+`model` 和 `reasoning_effort` 都接受 `arguments` 数组、可选 `default` 和可选
+`allowed_values`。两个参数数组必须分别恰好包含一个 `{model}` 或
+`{reasoning_effort}`。AgentBridge 会先验证调用值，再展开为独立 argv，并插入到提示词
+或提示词文件参数之前。省略 `allowed_values` 表示允许任意有长度上限的字符串，适合
+经常更新的模型目录。
+
+Codex 通过 `start_child_agent`（或兼容的 `start_task`）的 `model` 和
+`reasoning_effort` 字段指定它们。调用时省略某个值会采用别名内的 `default`；没有默认
+值时则完全不传对应 provider 参数。未配置某类映射的 CLI 会明确拒绝该运行时参数，
+不会静默忽略。
+
+任务元数据记录的是 AgentBridge 解析出的选择值，不是 provider 对实际执行模型的独立
+证明。启用 `allow_extra_args` 后，调用方不应再附加冲突的模型或 effort 参数；重复参数
+最终如何解释由 provider 自己的解析器决定。
+
+### Provider 会话与 follow-up
+
+`session.id_source` 支持两种方式：
+
+- `generated_uuid`：由 AgentBridge 生成 UUID，`start_arguments` 和
+  `resume_arguments` 用 `{session_id}` 接收它。Claude 别名分别映射到
+  `--session-id` 和 `--resume`。
+- `stdout_json`：任务成功后沿 `id_json_path` 从 stdout JSON 中提取字符串，再传给
+  `resume_arguments`。Antigravity 别名用 `--output-format json` 返回
+  `conversation_id`，并用 `--conversation` 续接。
+
+`send_followup` 会新建一个持久化子任务，同时复用 provider 会话，并继承别名、工作
+目录、模型、思考等级、超时和根任务关系。为避免同一会话损坏，只能续接该会话最新的
+终态任务，而且同一时刻只允许该会话存在一个活动任务。
 
 参数模式下，提示词可能出现在系统进程列表中；敏感任务优先使用 stdin 或文件模式。
 如果某个 CLI 必须使用管道、重定向或其他 shell 语法，请把这些逻辑写进经过审查的
@@ -108,7 +151,8 @@ shell。
 例如：
 
 ```text
-使用 $agent-bridge 让 Claude Code 审查当前仓库，并把结果返回给我。
+使用 $agent-bridge，让 Claude Code 以 opus 模型和 high 思考等级审查当前仓库，
+并把结果返回给我。
 ```
 
 ```text
@@ -122,7 +166,9 @@ shell。
 | --- | --- |
 | `list_agents` | 查看别名、限制、提示词模式和可执行文件可用性 |
 | `reload_config` | 重新验证活动参数文件并供后续任务使用 |
-| `start_task` | 用明确的别名、提示词和 `cwd` 启动异步任务 |
+| `start_child_agent` | 用模型、思考等级和可选父任务启动外部子智能体 |
+| `start_task` | `start_child_agent` 的向后兼容别名 |
+| `send_followup` | 续接最新 provider 会话，生成新的关联子任务 |
 | `get_task` | 不等待，读取当前元数据和分页输出 |
 | `wait_task` | 最多等待 50 秒，再返回元数据和输出 |
 | `list_tasks` | 列出最近任务，可按状态过滤 |
@@ -131,6 +177,11 @@ shell。
 任务状态包括 `queued`、`running`、`cancelling`、`succeeded`、`failed`、
 `timed_out`、`cancelled` 和 `interrupted`。`succeeded` 只表示进程返回码为零，
 Codex 仍需核实重要结论和工作区改动。
+
+每个任务都会报告 `task_kind: external_child_agent`、`parent_task_id`、
+`root_task_id`、`child_task_ids`、`invocation`、桥接层解析的 `model`/
+`reasoning_effort`，以及 provider 支持时的 `session_id`。Codex 因此可以重建外部委派
+树，同时不会把它误报为原生 Codex agent 线程树。
 
 输出按字节偏移分页；当 `has_more` 为 true 时继续使用该流的 `next_offset`。出现
 运行中任务的 `incomplete_utf8_tail` 为 true 时，应等待外部进程写完多字节字符后再读。
@@ -147,8 +198,8 @@ Codex 仍需核实重要结论和工作区改动。
 但是外部 CLI 自己控制 stdout/stderr，可能把提示词、参数、源码、凭据或其他敏感数据
 重新输出到日志。不要在提示词或命令行参数中放入秘密，并妥善保护状态目录。
 
-一个已启用别名意味着：当 Codex 调用 `start_task` 时，允许执行对应 argv。应把参数
-文件和包装脚本当作可执行配置审查。使用 `allowed_work_roots`、禁用别名、外部 CLI 的
+一个已启用别名意味着：当 Codex 调用启动或 follow-up 工具时，允许执行对应 argv。
+应把参数文件和包装脚本当作可执行配置审查。使用 `allowed_work_roots`、禁用别名、外部 CLI 的
 保守权限模式以及 Codex 审批设置来匹配风险模型。AgentBridge 不会绕过登录、工作区
 信任、访问挑战或权限控制。
 

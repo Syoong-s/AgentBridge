@@ -1,19 +1,22 @@
 # AgentBridge
 
-AgentBridge is a local Codex plugin that launches tasks in user-configured agent
-command-line tools and returns their bounded stdout, stderr, exit status, and lifecycle
-metadata to Codex.
+AgentBridge is a local Codex plugin that launches user-configured agent CLIs as
+plugin-managed external child agents and returns their bounded stdout, stderr, exit
+status, lineage, and lifecycle metadata to Codex.
 
-The bundled example is ready for Claude Code's non-interactive `-p` mode. Antigravity
-is included as a disabled template because its invocation contract depends on the
-installed CLI version. Any other CLI can be added as another JSON alias.
+The bundled aliases use the current documented commands for Claude Code (`claude -p`)
+and Google Antigravity CLI (`agy -p`). Antigravity remains disabled by default so a
+machine without `agy` still has a usable fallback configuration. Any other compatible
+CLI can be added as another JSON alias.
 
 ## Capabilities
 
 - direct argv execution without an implicit shell;
 - aliases and launch commands controlled by one JSON parameter file;
+- first-class model names and reasoning-effort levels mapped to provider-specific argv;
 - argument, stdin, and temporary prompt-file transport modes;
 - asynchronous tasks with bounded waits, paginated logs, and persistent metadata;
+- parent/root task lineage plus resumable provider sessions and follow-up turns;
 - concurrency limits, timeouts, cancellation of isolated POSIX process groups, and
   restart recovery;
 - optional working-directory allowlists and per-alias environment/extra-argument policy;
@@ -21,7 +24,9 @@ installed CLI version. Any other CLI can be added as another JSON alias.
 
 AgentBridge does not create a new model service or sandbox another CLI. Each configured
 agent runs locally with the permissions and authentication already available to that
-command.
+command. “External child agent” is an AgentBridge orchestration abstraction: it is not a
+native Codex subagent thread, does not appear in the native subagent UI, and does not
+inherit native Codex model, sandbox, or thread settings.
 
 ## Requirements
 
@@ -65,7 +70,11 @@ cp plugins/agent-bridge/config/agents.example.json \
   ~/.config/agent-bridge/config.json
 ```
 
-The file is versioned JSON:
+The file is versioned JSON. The bundled commands follow the current
+[Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage) and
+[Antigravity headless-mode reference](https://antigravity.google/docs/cli/headless/).
+Check `claude --help` or `agy --help` against the installed version before enabling a
+provider in production. Example:
 
 ```json
 {
@@ -88,7 +97,20 @@ The file is versioned JSON:
       "environment": {},
       "timeout_sec": 3600,
       "max_output_bytes": 2097152,
-      "allow_extra_args": true
+      "allow_extra_args": true,
+      "model": {
+        "arguments": ["--model", "{model}"]
+      },
+      "reasoning_effort": {
+        "default": "high",
+        "arguments": ["--effort", "{reasoning_effort}"],
+        "allowed_values": ["low", "medium", "high", "xhigh", "max", "ultracode"]
+      },
+      "session": {
+        "id_source": "generated_uuid",
+        "start_arguments": ["--session-id", "{session_id}"],
+        "resume_arguments": ["--resume", "{session_id}"]
+      }
     }
   }
 }
@@ -118,12 +140,52 @@ The file is versioned JSON:
 | `timeout_sec` | Alias-specific default timeout |
 | `max_output_bytes` | Per-stream persisted byte ceiling, 1 KiB to 100 MiB |
 | `allow_extra_args` | Permit discrete runtime argv items after the configured command |
+| `model` | Optional portable model selector mapped to provider argv |
+| `reasoning_effort` | Optional portable thinking/effort selector mapped to provider argv |
+| `session` | Optional provider conversation creation/extraction/resume contract |
 
 Supported placeholders are `{prompt}`, `{prompt_file}`, `{cwd}`, and `{task_id}`.
 Argument mode requires exactly one `{prompt}`. File mode requires exactly one
 `{prompt_file}` and deletes that private temporary file after the task. Stdin mode must
 not contain either prompt placeholder. Prompt placeholders are forbidden in
 `command[0]`.
+
+### Model and reasoning mappings
+
+`model` and `reasoning_effort` each accept an `arguments` array, optional `default`, and
+optional `allowed_values`. Their argument arrays must contain exactly one `{model}` or
+`{reasoning_effort}` placeholder respectively. A requested value is validated before
+launch, expanded into discrete argv, and inserted immediately before the configured
+prompt/prompt-file argument. Omitting `allowed_values` permits any bounded string, which
+is useful for provider model catalogs that change over time.
+
+Codex supplies these through the `model` and `reasoning_effort` fields of
+`start_child_agent` (or the compatible `start_task`). If Codex omits a value, AgentBridge
+uses the alias `default`; if there is no default, that provider flag is omitted. A CLI
+without the corresponding mapping rejects that runtime selector instead of silently
+ignoring it.
+
+The task metadata records the selector resolved by AgentBridge, not an independent
+provider attestation. When `allow_extra_args` is enabled, callers must not append
+conflicting model/effort flags; the provider's own parser decides how duplicate flags
+behave.
+
+### Provider sessions and follow-ups
+
+`session.id_source` is either `generated_uuid` or `stdout_json`:
+
+- `generated_uuid` creates a UUID and requires `start_arguments` plus
+  `resume_arguments` containing `{session_id}`. The Claude alias maps these to
+  `--session-id` and `--resume`.
+- `stdout_json` extracts a string by following `id_json_path` through the completed
+  stdout JSON object, then substitutes it into `resume_arguments`. The Antigravity
+  alias uses `--output-format json`, extracts `conversation_id`, and resumes with
+  `--conversation`.
+
+`send_followup` starts a new persisted child task while reusing the provider session.
+It inherits the alias, working directory, selected model/effort, timeout, and root
+lineage. To prevent session corruption, only the latest terminal task in a session can
+be continued, and only one task in that session may be active.
 
 Use argument mode only when process-list visibility is acceptable. Prefer stdin or file
 mode for sensitive prompts. If a CLI needs pipes, redirection, or other shell syntax,
@@ -139,7 +201,8 @@ requires restarting the MCP server.
 Example requests:
 
 ```text
-Use $agent-bridge to ask Claude Code to review this repository and return its findings.
+Use $agent-bridge to ask Claude Code with model opus and reasoning effort high to review
+this repository and return its findings.
 ```
 
 ```text
@@ -153,7 +216,9 @@ The skill guides Codex through these MCP tools:
 | --- | --- |
 | `list_agents` | Inspect aliases, limits, prompt modes, and executable availability |
 | `reload_config` | Validate the active file and replace configuration for future tasks |
-| `start_task` | Launch one asynchronous task with explicit alias, prompt, and `cwd` |
+| `start_child_agent` | Launch an external child-agent task with model, effort, and optional lineage |
+| `start_task` | Backward-compatible alias of `start_child_agent` |
+| `send_followup` | Resume the latest provider session as a new linked child task |
 | `get_task` | Read current metadata and paginated output without waiting |
 | `wait_task` | Wait for up to 50 seconds, then return current metadata and output |
 | `list_tasks` | List recent task metadata, optionally filtered by status |
@@ -162,6 +227,11 @@ The skill guides Codex through these MCP tools:
 Task states are `queued`, `running`, `cancelling`, `succeeded`, `failed`, `timed_out`,
 `cancelled`, and `interrupted`. `succeeded` means the process returned zero; Codex still
 must verify consequential claims and workspace edits.
+
+Every task reports `task_kind: external_child_agent`, `parent_task_id`, `root_task_id`,
+`child_task_ids`, `invocation`, bridge-resolved `model`/`reasoning_effort`, and `session_id`
+when supported. These fields let Codex reconstruct the external delegation tree without
+misrepresenting it as a native Codex agent-thread tree.
 
 Output is paginated by byte offsets. Follow each stream's `next_offset` while `has_more`
 is true. On a running task, `incomplete_utf8_tail` asks the caller to wait until the
@@ -181,7 +251,8 @@ own stdout/stderr and may echo prompts, arguments, source code, credentials, or 
 sensitive data into logs. Do not place secrets in prompts or command-line arguments, and
 protect the state directory accordingly.
 
-A configured alias is permission to execute its argv when Codex calls `start_task`.
+A configured alias is permission to execute its argv when Codex calls a launch or
+follow-up tool.
 Review parameter files and wrapper scripts as executable configuration. Use
 `allowed_work_roots`, disabled aliases, conservative CLI permission modes, and Codex
 approval settings to match your risk model. AgentBridge never bypasses an agent's login,

@@ -142,6 +142,48 @@ class TaskManagerTests(unittest.TestCase):
                 "prompt_mode": "argument",
                 "timeout_sec": 20,
             },
+            "generated-session": {
+                "command": [python, fake, "--report-selection", "{prompt}"],
+                "prompt_mode": "argument",
+                "allow_extra_args": True,
+                "model": {
+                    "default": "default-model",
+                    "arguments": ["--model", "{model}"],
+                },
+                "reasoning_effort": {
+                    "default": "medium",
+                    "arguments": ["--effort", "{reasoning_effort}"],
+                    "allowed_values": ["low", "medium", "high"],
+                },
+                "session": {
+                    "id_source": "generated_uuid",
+                    "start_arguments": ["--session-id", "{session_id}"],
+                    "resume_arguments": ["--resume", "{session_id}"],
+                },
+            },
+            "json-session": {
+                "command": [python, fake, "--emit-json-session", "{prompt}"],
+                "prompt_mode": "argument",
+                "model": {"arguments": ["--model", "{model}"]},
+                "reasoning_effort": {
+                    "arguments": ["--effort", "{reasoning_effort}"],
+                    "allowed_values": ["low", "medium", "high"],
+                },
+                "session": {
+                    "id_source": "stdout_json",
+                    "resume_arguments": ["--conversation", "{session_id}"],
+                    "id_json_path": ["conversation_id"],
+                },
+            },
+            "broken-json-session": {
+                "command": [python, fake, "{prompt}"],
+                "prompt_mode": "argument",
+                "session": {
+                    "id_source": "stdout_json",
+                    "resume_arguments": ["--conversation", "{session_id}"],
+                    "id_json_path": ["conversation_id"],
+                },
+            },
         }
 
     # ==========================================
@@ -211,6 +253,214 @@ class TaskManagerTests(unittest.TestCase):
         started = manager.start_task("argument", prompt, str(self.work))
         result = self.wait_terminal(manager, started["task_id"])
         self.assertEqual(result["stdout"]["text"], prompt)
+
+    # ==========================================
+    # Function: Map portable model and reasoning inputs into provider-specific arguments.
+    # Method: Override configured defaults and observe the fake CLI's parsed option values.
+    # ==========================================
+    def test_model_reasoning_and_generated_session_are_first_class(self) -> None:
+        manager = self.make_manager()
+        started = manager.start_task(
+            "generated-session",
+            "selection-result",
+            str(self.work),
+            model="selected-model",
+            reasoning_effort="high",
+        )
+        result = self.wait_terminal(manager, started["task_id"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["task_kind"], "external_child_agent")
+        self.assertEqual(result["invocation"], "start")
+        self.assertEqual(result["root_task_id"], result["task_id"])
+        self.assertIsNone(result["parent_task_id"])
+        self.assertEqual(result["model"], "selected-model")
+        self.assertEqual(result["reasoning_effort"], "high")
+        self.assertRegex(result["session_id"], r"^[0-9a-f-]{36}$")
+        self.assertEqual(
+            result["command"],
+            [
+                sys.executable,
+                str(FAKE_AGENT),
+                "--report-selection",
+                "--model",
+                "selected-model",
+                "--effort",
+                "high",
+                "--session-id",
+                result["session_id"],
+                "<prompt>",
+            ],
+        )
+        self.assertEqual(
+            result["stdout"]["text"],
+            (
+                f"model=selected-model|effort=high|session={result['session_id']}|"
+                "selection-result"
+            ),
+        )
+
+    # ==========================================
+    # Function: Continue a generated provider session as a linear external child-agent chain.
+    # Method: Resume the latest task, verify inherited controls/lineage, and reject a stale parent.
+    # ==========================================
+    def test_generated_session_followup_preserves_lineage(self) -> None:
+        manager = self.make_manager()
+        root = manager.start_task("generated-session", "first", str(self.work))
+        root = self.wait_terminal(manager, root["task_id"])
+        child = manager.send_followup(root["task_id"], "second")
+        child = self.wait_terminal(manager, child["task_id"])
+        self.assertEqual(child["status"], "succeeded")
+        self.assertEqual(child["invocation"], "followup")
+        self.assertEqual(child["parent_task_id"], root["task_id"])
+        self.assertEqual(child["root_task_id"], root["task_id"])
+        self.assertEqual(child["session_id"], root["session_id"])
+        self.assertEqual(child["model"], "default-model")
+        self.assertEqual(child["reasoning_effort"], "medium")
+        self.assertIn(f"session={root['session_id']}|second", child["stdout"]["text"])
+        refreshed_root = manager.get_task(root["task_id"])
+        self.assertEqual(refreshed_root["child_task_ids"], [child["task_id"]])
+        with self.assertRaisesRegex(TaskError, "stale"):
+            manager.send_followup(root["task_id"], "third")
+
+    # ==========================================
+    # Function: Preserve an omitted selector across a configuration reload.
+    # Method: Add new alias defaults after the first turn and ensure its follow-up remains unchanged.
+    # ==========================================
+    def test_followup_does_not_inject_new_selector_defaults_after_reload(self) -> None:
+        agents = self.agent_definitions()
+        generated = agents["generated-session"]
+        generated["model"] = {"arguments": ["--model", "{model}"]}
+        generated["reasoning_effort"] = {
+            "arguments": ["--effort", "{reasoning_effort}"],
+            "allowed_values": ["low", "medium", "high"],
+        }
+        manager = self.make_manager(agents={"generated-session": generated})
+        root = manager.start_task("generated-session", "first", str(self.work))
+        root = self.wait_terminal(manager, root["task_id"])
+        self.assertIsNone(root["model"])
+        self.assertIsNone(root["reasoning_effort"])
+
+        config_path = manager.config.path
+        document = json.loads(config_path.read_text(encoding="utf-8"))
+        document["agents"]["generated-session"]["model"]["default"] = "new-model"
+        document["agents"]["generated-session"]["reasoning_effort"]["default"] = "high"
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+        manager.replace_config(load_config(config_path, state_dir=self.state))
+
+        child = manager.send_followup(root["task_id"], "second")
+        child = self.wait_terminal(manager, child["task_id"])
+        self.assertEqual(child["status"], "succeeded")
+        self.assertIsNone(child["model"])
+        self.assertIsNone(child["reasoning_effort"])
+        self.assertEqual(
+            child["command"],
+            [
+                sys.executable,
+                str(FAKE_AGENT),
+                "--report-selection",
+                "--resume",
+                root["session_id"],
+                "<prompt>",
+            ],
+        )
+
+    # ==========================================
+    # Function: Prevent overlapping work in one provider conversation.
+    # Method: Start a sleeping follow-up, reject a sibling continuation, then cancel cleanly.
+    # ==========================================
+    def test_provider_session_rejects_concurrent_followup(self) -> None:
+        manager = self.make_manager()
+        root = manager.start_task("generated-session", "first", str(self.work))
+        root = self.wait_terminal(manager, root["task_id"])
+        child = manager.send_followup(
+            root["task_id"],
+            "slow-child",
+            extra_args=["--sleep", "10"],
+        )
+        with self.assertRaisesRegex(TaskError, "already has an active task"):
+            manager.send_followup(root["task_id"], "overlap")
+        manager.cancel_task(child["task_id"])
+        self.assertEqual(self.wait_terminal(manager, child["task_id"])["status"], "cancelled")
+
+    # ==========================================
+    # Function: Refuse follow-up semantics for aliases without provider session support.
+    # Method: Complete an ordinary task and require an actionable missing-session error.
+    # ==========================================
+    def test_followup_requires_configured_provider_session(self) -> None:
+        manager = self.make_manager()
+        root = manager.start_task("argument", "first", str(self.work))
+        root = self.wait_terminal(manager, root["task_id"])
+        with self.assertRaisesRegex(TaskError, "no resumable provider session ID"):
+            manager.send_followup(root["task_id"], "second")
+
+    # ==========================================
+    # Function: Recover external child-agent lineage and session fields across manager restart.
+    # Method: Complete a generated session, reload the same state root, and compare metadata.
+    # ==========================================
+    def test_session_metadata_survives_recovery(self) -> None:
+        first_manager = self.make_manager()
+        root = first_manager.start_task("generated-session", "first", str(self.work))
+        root = self.wait_terminal(first_manager, root["task_id"])
+        recovered_manager = self.make_manager(state=self.state)
+        recovered = recovered_manager.get_task(root["task_id"])
+        self.assertEqual(recovered["task_kind"], "external_child_agent")
+        self.assertEqual(recovered["root_task_id"], root["task_id"])
+        self.assertEqual(recovered["model"], "default-model")
+        self.assertEqual(recovered["reasoning_effort"], "medium")
+        self.assertEqual(recovered["session_id"], root["session_id"])
+
+    # ==========================================
+    # Function: Extract and resume a provider-generated JSON conversation identifier.
+    # Method: Parse initial stdout metadata and pass the ID through configured resume argv.
+    # ==========================================
+    def test_stdout_json_session_can_be_resumed(self) -> None:
+        manager = self.make_manager()
+        root = manager.start_task(
+            "json-session",
+            "first-json",
+            str(self.work),
+            model="json-model",
+            reasoning_effort="low",
+        )
+        root = self.wait_terminal(manager, root["task_id"])
+        self.assertEqual(root["status"], "succeeded")
+        self.assertEqual(root["session_id"], "fake-conversation-id")
+        child = manager.send_followup(root["task_id"], "second-json")
+        child = self.wait_terminal(manager, child["task_id"])
+        payload = json.loads(child["stdout"]["text"])
+        self.assertEqual(payload["conversation_id"], root["session_id"])
+        self.assertEqual(payload["response"], "second-json")
+        self.assertEqual(payload["model"], "json-model")
+        self.assertEqual(payload["effort"], "low")
+
+    # ==========================================
+    # Function: Reject invalid or unavailable portable selector requests.
+    # Method: Exercise allowlist enforcement and aliases without selector mappings.
+    # ==========================================
+    def test_invalid_model_and_reasoning_requests_are_rejected(self) -> None:
+        manager = self.make_manager()
+        with self.assertRaisesRegex(TaskError, "does not configure model"):
+            manager.start_task("argument", "x", str(self.work), model="any")
+        with self.assertRaisesRegex(TaskError, "must be one of"):
+            manager.start_task(
+                "generated-session",
+                "x",
+                str(self.work),
+                reasoning_effort="extreme",
+            )
+
+    # ==========================================
+    # Function: Fail loudly when a configured provider session ID cannot be extracted.
+    # Method: Let the CLI exit zero with non-JSON stdout and verify a failed task plus evidence.
+    # ==========================================
+    def test_missing_stdout_json_session_id_fails_task(self) -> None:
+        manager = self.make_manager()
+        started = manager.start_task("broken-json-session", "plain-output", str(self.work))
+        result = self.wait_terminal(manager, started["task_id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["return_code"], 0)
+        self.assertIn("provider stdout is not valid JSON", result["error"])
+        self.assertEqual(result["stdout"]["text"], "plain-output")
 
     # ==========================================
     # Function: Avoid leaving task state or prompt files when an executable is unavailable.
