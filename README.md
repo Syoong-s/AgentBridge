@@ -9,6 +9,10 @@ and Google Antigravity CLI (`agy -p`). Antigravity remains disabled by default s
 machine without `agy` still has a usable fallback configuration. Any other compatible
 CLI can be added as another JSON alias.
 
+The Antigravity argv stores the prompt as the single item `-p={prompt}` and places
+`--output-format json` before it. This is required by `agy` 1.2.0 so an intervening CLI
+flag is not consumed as the prompt.
+
 ## Capabilities
 
 - direct argv execution without an implicit shell;

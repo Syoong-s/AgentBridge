@@ -2,6 +2,13 @@
 
 All notable changes to AgentBridge are documented here.
 
+## 0.2.1 - 2026-09-10
+
+- Attach the Antigravity prompt directly to `-p` so CLI flags cannot be consumed as
+  the prompt by `agy` 1.2.0.
+- Validate the corrected command through a live authenticated AgentBridge launch with
+  Gemini 3.8 Flash at high reasoning effort.
+
 ## 0.2.0 - 2026-09-10
 
 - Add first-class, alias-mapped model and reasoning-effort launch controls.

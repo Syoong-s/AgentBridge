@@ -8,6 +8,10 @@ AgentBridge 是一个本地 Codex 插件：它把用户配置的命令行 agent 
 CLI 命令 `agy -p`。Antigravity 默认保持禁用，避免未安装 `agy` 的机器无法使用回退
 配置；安装并认证后可直接启用。其他兼容 agent CLI 也可以通过新增 JSON 别名接入。
 
+Antigravity 的 argv 把提示词保存为单独一项 `-p={prompt}`，并把
+`--output-format json` 放在它之前。这是 `agy` 1.2.0 的实际参数要求，可避免中间的
+CLI flag 被误当成提示词。
+
 ## 主要能力
 
 - 用 argv 数组直接启动进程，不隐式调用 shell；

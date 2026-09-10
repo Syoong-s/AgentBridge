@@ -59,10 +59,9 @@
       "description": "Google Antigravity CLI in headless JSON mode (official executable: agy)",
       "command": [
         "agy",
-        "-p",
         "--output-format",
         "json",
-        "{prompt}"
+        "-p={prompt}"
       ],
       "prompt_mode": "argument",
       "inherit_env": true,

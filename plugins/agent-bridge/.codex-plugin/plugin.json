@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Launch configurable external agent CLIs as linked child tasks with model, reasoning, session, and result controls.",
   "author": {
     "name": "Syoong-s",

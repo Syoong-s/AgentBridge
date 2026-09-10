@@ -260,7 +260,7 @@ class ConfigTests(unittest.TestCase):
         antigravity = config.agents["antigravity"]
         self.assertEqual(
             antigravity.command,
-            ("agy", "-p", "--output-format", "json", "{prompt}"),
+            ("agy", "--output-format", "json", "-p={prompt}"),
         )
         self.assertEqual(antigravity.reasoning_effort.allowed_values, ("low", "medium", "high"))
         self.assertEqual(antigravity.session.id_source, "stdout_json")
