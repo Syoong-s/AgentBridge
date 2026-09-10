@@ -1,0 +1,65 @@
+name: Release AgentBridge
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, package, and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run source validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -v
+          python3 -m compileall -q plugins/agent-bridge/scripts tests scripts
+          bash -n plugins/agent-bridge/scripts/*.sh
+          python3 -m json.tool .agents/plugins/marketplace.json >/dev/null
+          python3 -m json.tool plugins/agent-bridge/.codex-plugin/plugin.json >/dev/null
+          python3 -m json.tool plugins/agent-bridge/.mcp.json >/dev/null
+          python3 -m json.tool plugins/agent-bridge/config/agents.example.json >/dev/null
+
+      - name: Build deterministic release assets
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python3 scripts/package_release.py --tag "$RELEASE_TAG" --output-dir dist
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          gh release create "$RELEASE_TAG" \
+            "dist/agent-bridge-${version}.zip#AgentBridge ${version} (ZIP)" \
+            "dist/agent-bridge-${version}.tar.gz#AgentBridge ${version} (tar.gz)" \
+            "dist/SHA256SUMS#SHA-256 checksums" \
+            --verify-tag \
+            --generate-notes \
+            --title "AgentBridge ${version}"

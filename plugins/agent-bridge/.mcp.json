@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agent-bridge": {
+      "command": "bash",
+      "args": [
+        "./scripts/start.sh"
+      ],
+      "cwd": ".",
+      "tool_timeout_sec": 60
+    }
+  }
+}

@@ -1,0 +1,12 @@
+interface:
+  display_name: "Agent Bridge"
+  short_description: "Delegate tasks to configured local agent CLIs"
+  brand_color: "#7C3AED"
+  default_prompt: "Use $agent-bridge to run this task with a configured external agent and return its verified result."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "agent-bridge"
+      description: "Local stdio MCP bridge for configurable external agent CLIs"
+policy:
+  allow_implicit_invocation: true
