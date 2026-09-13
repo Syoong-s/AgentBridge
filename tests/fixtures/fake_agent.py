@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--environment")
     parser.add_argument("--spawn-child", action="store_true")
     parser.add_argument("--child-pid-file")
+    parser.add_argument("--before-output-sleep", type=float, default=0.0)
     parser.add_argument("--early-output", default="")
     parser.add_argument("--model")
     parser.add_argument("--effort")
@@ -65,6 +66,8 @@ def main() -> int:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         if arguments.child_pid_file:
             Path(arguments.child_pid_file).write_text(str(child.pid), encoding="utf-8")
+    if arguments.before_output_sleep:
+        time.sleep(arguments.before_output_sleep)
     if arguments.early_output:
         sys.stdout.write(arguments.early_output)
         sys.stdout.flush()

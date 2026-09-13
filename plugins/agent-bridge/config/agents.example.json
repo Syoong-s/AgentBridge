@@ -55,7 +55,7 @@
       }
     },
     "antigravity": {
-      "enabled": false,
+      "enabled": true,
       "description": "Google Antigravity CLI in headless JSON mode (official executable: agy)",
       "command": [
         "agy",

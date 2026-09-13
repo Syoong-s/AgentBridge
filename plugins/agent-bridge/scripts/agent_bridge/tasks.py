@@ -156,6 +156,7 @@ class TaskRecord:
     finished_at: str | None = None
     return_code: int | None = None
     error: str | None = None
+    persistence_error: str | None = None
     pid: int | None = None
     process_start_ticks: int | None = None
     stdout_truncated: bool = False
@@ -164,6 +165,17 @@ class TaskRecord:
     worker: threading.Thread | None = field(default=None, repr=False)
     cancel_requested: threading.Event = field(default_factory=threading.Event, repr=False)
     done: threading.Event = field(default_factory=threading.Event, repr=False)
+    changed: threading.Event = field(default_factory=threading.Event, repr=False)
+    change_sequence: int = field(default=0, repr=False)
+
+
+# ==========================================
+# Class: Mutable outcome from one asynchronous stream-capture worker.
+# Method: Record the first capture failure for terminal task-state reconciliation.
+# ==========================================
+@dataclass
+class StreamCaptureState:
+    error: str | None = None
 
 
 # ==========================================
@@ -241,6 +253,7 @@ class TaskManager:
             "max_output_bytes": record.max_output_bytes,
             "return_code": record.return_code,
             "error": record.error,
+            "persistence_error": record.persistence_error,
             "pid": record.pid,
             "process_start_ticks": record.process_start_ticks,
             "stdout_bytes": stdout_path.stat().st_size if stdout_path.is_file() else 0,
@@ -255,6 +268,43 @@ class TaskManager:
     # ==========================================
     def _save_record(self, record: TaskRecord) -> None:
         atomic_write_json(self._task_dir(record.task_id) / "metadata.json", self._metadata(record))
+
+    # ==========================================
+    # Function: Add one diagnostic without discarding an earlier task failure.
+    # Method: Join distinct messages in observation order for one public error field.
+    # ==========================================
+    @staticmethod
+    def _append_record_error(record: TaskRecord, message: str) -> None:
+        record.error = f"{record.error}; {message}" if record.error else message
+
+    # ==========================================
+    # Function: Publish one task change to every current or future waiter.
+    # Method: Increment a monotonic sequence under lock before setting the shared wake event.
+    # ==========================================
+    def _signal_change(self, record: TaskRecord) -> None:
+        with self._lock:
+            record.change_sequence += 1
+            record.changed.set()
+
+    # ==========================================
+    # Function: Persist a terminal task result without leaking exceptions from its worker.
+    # Method: Convert failed writes into a conservative failed result and retry that diagnosis once.
+    # ==========================================
+    def _persist_terminal_record(self, record: TaskRecord) -> None:
+        try:
+            self._save_record(record)
+            return
+        except Exception as exc:
+            message = f"terminal metadata persistence failed: {exc}"
+            record.status = "failed"
+            record.persistence_error = message
+            self._append_record_error(record, message)
+        try:
+            self._save_record(record)
+        except Exception as exc:
+            message = f"terminal metadata persistence retry failed: {exc}"
+            record.persistence_error = f"{record.persistence_error}; {message}"
+            self._append_record_error(record, message)
 
     # ==========================================
     # Function: Rehydrate a task record from validated persisted metadata.
@@ -314,6 +364,11 @@ class TaskManager:
             finished_at=value.get("finished_at") if isinstance(value.get("finished_at"), str) else None,
             return_code=value.get("return_code") if isinstance(value.get("return_code"), int) else None,
             error=value.get("error") if isinstance(value.get("error"), str) else None,
+            persistence_error=(
+                value.get("persistence_error")
+                if isinstance(value.get("persistence_error"), str)
+                else None
+            ),
             pid=value.get("pid") if isinstance(value.get("pid"), int) else None,
             process_start_ticks=(
                 value.get("process_start_ticks")
@@ -410,6 +465,7 @@ class TaskManager:
         environment = dict(os.environ) if agent.inherit_env else {}
         for key, value in agent.environment.items():
             environment[key] = substitute(value, replacements)
+        environment["PWD"] = replacements["{cwd}"]
         return environment
 
     # ==========================================
@@ -727,8 +783,22 @@ class TaskManager:
             )
 
     # ==========================================
+    # Function: Preserve the first failure observed by one stream-capture worker.
+    # Method: Attach the stream and operation names without overwriting the root cause.
+    # ==========================================
+    @staticmethod
+    def _set_capture_error(
+        state: StreamCaptureState,
+        stream_name: str,
+        operation: str,
+        error: BaseException,
+    ) -> None:
+        if state.error is None:
+            state.error = f"{stream_name} {operation} failed: {error}"
+
+    # ==========================================
     # Function: Drain one child stream while enforcing its persisted byte ceiling.
-    # Method: Continue reading after truncation so the child cannot block on a full pipe.
+    # Method: Persist bounded bytes, report I/O failures, and keep draining after write loss.
     # ==========================================
     def _drain_stream(
         self,
@@ -737,32 +807,118 @@ class TaskManager:
         limit: int,
         record: TaskRecord,
         stream_name: str,
+        state: StreamCaptureState,
     ) -> None:
         written = 0
         truncated = False
-        with path.open("wb") as destination:
-            path.chmod(0o600)
+        destination: BinaryIO | None = None
+        try:
+            try:
+                destination = path.open("wb")
+            except OSError as exc:
+                self._set_capture_error(state, stream_name, "log open", exc)
+            try:
+                path.chmod(0o600)
+            except OSError as exc:
+                self._set_capture_error(state, stream_name, "log permission update", exc)
+
             while True:
                 try:
                     chunk = os.read(stream.fileno(), 65536)
-                except OSError:
-                    chunk = b""
+                except OSError as exc:
+                    self._set_capture_error(state, stream_name, "pipe read", exc)
+                    break
                 if not chunk:
                     break
+                if destination is None:
+                    truncated = True
+                    continue
                 remaining = max(0, limit - written)
                 if remaining:
                     accepted = chunk[:remaining]
-                    destination.write(accepted)
-                    destination.flush()
+                    try:
+                        persisted = destination.write(accepted)
+                        if persisted != len(accepted):
+                            raise OSError(
+                                f"short write: expected {len(accepted)} bytes, wrote {persisted}"
+                            )
+                        destination.flush()
+                    except OSError as exc:
+                        self._set_capture_error(state, stream_name, "log write", exc)
+                        truncated = True
+                        try:
+                            destination.close()
+                        except OSError as close_exc:
+                            self._set_capture_error(
+                                state,
+                                stream_name,
+                                "log close",
+                                close_exc,
+                            )
+                        destination = None
+                        continue
                     written += len(accepted)
+                    self._signal_change(record)
                 if len(chunk) > remaining:
                     truncated = True
-        stream.close()
-        with self._lock:
-            if stream_name == "stdout":
-                record.stdout_truncated = truncated
-            else:
-                record.stderr_truncated = truncated
+        finally:
+            if destination is not None:
+                try:
+                    destination.close()
+                except OSError as exc:
+                    self._set_capture_error(state, stream_name, "log close", exc)
+            try:
+                stream.close()
+            except OSError as exc:
+                self._set_capture_error(state, stream_name, "pipe close", exc)
+            with self._lock:
+                if stream_name == "stdout":
+                    record.stdout_truncated = truncated
+                else:
+                    record.stderr_truncated = truncated
+            self._signal_change(record)
+
+    # ==========================================
+    # Function: Contain unexpected exceptions at the stream-worker thread boundary.
+    # Method: Mark capture failed, drain remaining pipe bytes best-effort, and always wake waiters.
+    # ==========================================
+    def _capture_stream(
+        self,
+        stream: BinaryIO,
+        path: Path,
+        limit: int,
+        record: TaskRecord,
+        stream_name: str,
+        state: StreamCaptureState,
+    ) -> None:
+        try:
+            self._drain_stream(stream, path, limit, record, stream_name, state)
+        except Exception as exc:
+            self._set_capture_error(state, stream_name, "worker", exc)
+            while True:
+                try:
+                    chunk = os.read(stream.fileno(), 65536)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    break
+            try:
+                stream.close()
+            except OSError:
+                pass
+            try:
+                with self._lock:
+                    if stream_name == "stdout":
+                        record.stdout_truncated = True
+                    else:
+                        record.stderr_truncated = True
+            except Exception:
+                pass
+        finally:
+            try:
+                self._signal_change(record)
+            except Exception:
+                pass
 
     # ==========================================
     # Function: Feed a prompt to an agent configured for stdin transport.
@@ -891,11 +1047,17 @@ class TaskManager:
         stderr_path = task_dir / "stderr.log"
         timed_out = False
         process: subprocess.Popen[bytes] | None = None
+        stdout_state = StreamCaptureState()
+        stderr_state = StreamCaptureState()
+        final_status = "failed"
+        final_error: str | None = None
+        final_return_code: int | None = None
+        final_session_id = record.session_id
         try:
             with self._lock:
                 if record.cancel_requested.is_set():
-                    record.status = "cancelled"
-                    record.error = "task was cancelled before process launch"
+                    final_status = "cancelled"
+                    final_error = "task was cancelled before process launch"
                     return
                 process = subprocess.Popen(
                     command,
@@ -911,18 +1073,33 @@ class TaskManager:
                 record.process_start_ticks = process_start_ticks(process.pid)
                 record.status = "running"
                 record.started_at = utc_now()
+                self._signal_change(record)
                 self._save_record(record)
 
             assert process.stdout is not None
             assert process.stderr is not None
             stdout_worker = threading.Thread(
-                target=self._drain_stream,
-                args=(process.stdout, stdout_path, record.max_output_bytes, record, "stdout"),
+                target=self._capture_stream,
+                args=(
+                    process.stdout,
+                    stdout_path,
+                    record.max_output_bytes,
+                    record,
+                    "stdout",
+                    stdout_state,
+                ),
                 daemon=True,
             )
             stderr_worker = threading.Thread(
-                target=self._drain_stream,
-                args=(process.stderr, stderr_path, record.max_output_bytes, record, "stderr"),
+                target=self._capture_stream,
+                args=(
+                    process.stderr,
+                    stderr_path,
+                    record.max_output_bytes,
+                    record,
+                    "stderr",
+                    stderr_state,
+                ),
                 daemon=True,
             )
             stdout_worker.start()
@@ -947,53 +1124,94 @@ class TaskManager:
                     break
             return_code = process.wait()
             self._terminate_remaining_group(process.pid)
-            stdout_worker.join(timeout=5)
-            stderr_worker.join(timeout=5)
+            for stream_name, worker, stream, state in (
+                ("stdout", stdout_worker, process.stdout, stdout_state),
+                ("stderr", stderr_worker, process.stderr, stderr_state),
+            ):
+                worker.join(timeout=5)
+                if worker.is_alive():
+                    self._set_capture_error(
+                        state,
+                        stream_name,
+                        "worker completion",
+                        TimeoutError("capture thread did not finish within 5 seconds"),
+                    )
+                    try:
+                        stream.close()
+                    except OSError as exc:
+                        self._set_capture_error(state, stream_name, "pipe close", exc)
+                    worker.join(timeout=1)
+                    with self._lock:
+                        if stream_name == "stdout":
+                            record.stdout_truncated = True
+                        else:
+                            record.stderr_truncated = True
+            capture_errors = [
+                state.error for state in (stdout_state, stderr_state) if state.error is not None
+            ]
+            capture_error = "; ".join(capture_errors) if capture_errors else None
             session_error: str | None = None
             if (
                 return_code == 0
                 and not timed_out
                 and not record.cancel_requested.is_set()
-                and record.session_id is None
+                and capture_error is None
+                and final_session_id is None
                 and agent.session is not None
                 and agent.session.id_source == "stdout_json"
             ):
                 try:
-                    record.session_id = self._extract_stdout_session_id(record, agent)
+                    final_session_id = self._extract_stdout_session_id(record, agent)
                 except TaskError as exc:
                     session_error = str(exc)
 
-            with self._lock:
-                record.return_code = return_code
-                if record.cancel_requested.is_set():
-                    record.status = "cancelled"
-                    record.error = "task was cancelled"
-                elif timed_out:
-                    record.status = "timed_out"
-                    record.error = f"task exceeded timeout_sec={record.timeout_sec}"
-                elif session_error is not None:
-                    record.status = "failed"
-                    record.error = f"could not capture resumable provider session: {session_error}"
-                elif return_code == 0:
-                    record.status = "succeeded"
-                else:
-                    record.status = "failed"
-                    record.error = f"agent process exited with code {return_code}"
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            final_return_code = return_code
+            if record.cancel_requested.is_set():
+                final_status = "cancelled"
+                final_error = "task was cancelled"
+            elif timed_out:
+                final_status = "timed_out"
+                final_error = f"task exceeded timeout_sec={record.timeout_sec}"
+            elif capture_error is not None:
+                final_status = "failed"
+                final_error = f"could not capture agent output: {capture_error}"
+            elif session_error is not None:
+                final_status = "failed"
+                final_error = f"could not capture resumable provider session: {session_error}"
+            elif return_code == 0:
+                final_status = "succeeded"
+            else:
+                final_status = "failed"
+                final_error = f"agent process exited with code {return_code}"
+        except Exception as exc:
             if process is not None:
                 self._terminate_process(process)
-            with self._lock:
-                record.status = "cancelled" if record.cancel_requested.is_set() else "failed"
-                record.error = f"could not execute agent process: {exc}"
+            final_status = "cancelled" if record.cancel_requested.is_set() else "failed"
+            final_error = f"could not execute agent process: {exc}"
         finally:
+            cleanup_error: str | None = None
             if agent.prompt_mode == "file":
-                (task_dir / "prompt.txt").unlink(missing_ok=True)
+                try:
+                    (task_dir / "prompt.txt").unlink(missing_ok=True)
+                except OSError as exc:
+                    cleanup_error = f"could not remove temporary prompt file: {exc}"
             with self._lock:
+                record.status = final_status
+                record.error = final_error
+                record.return_code = final_return_code
+                record.session_id = final_session_id
+                if cleanup_error is not None:
+                    record.status = "failed"
+                    self._append_record_error(record, cleanup_error)
                 record.finished_at = utc_now()
                 record.process = None
+                self._persist_terminal_record(record)
                 record.done.set()
-                self._save_record(record)
-                self._prune_history(preserve_task_id=record.task_id)
+                self._signal_change(record)
+                try:
+                    self._prune_history(preserve_task_id=record.task_id)
+                except Exception:
+                    pass
 
     # ==========================================
     # Function: Convert one record into a public, prompt-redacted result object.
@@ -1082,8 +1300,8 @@ class TaskManager:
             return public
 
     # ==========================================
-    # Function: Wait a bounded interval for one task and return current output.
-    # Method: Block on the record event for at most 50 seconds, then delegate to get_task.
+    # Function: Wait a bounded interval for task progress and return current output.
+    # Method: Wake on readable bytes, status changes, stream completion, cancellation, or deadline.
     # ==========================================
     def wait_task(
         self,
@@ -1092,18 +1310,41 @@ class TaskManager:
         stdout_offset: int = 0,
         stderr_offset: int = 0,
         max_bytes: int = 65536,
+        cancellation_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if isinstance(wait_sec, bool) or not isinstance(wait_sec, int) or not 0 <= wait_sec <= 50:
             raise TaskError("wait_sec must be an integer between 0 and 50")
         if not isinstance(task_id, str) or TASK_ID_PATTERN.fullmatch(task_id) is None:
             raise TaskError("task_id must be a valid string identifier")
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise TaskError("wait request was cancelled")
         with self._lock:
             record = self._tasks.get(task_id)
             if record is None:
                 raise TaskError(f"unknown task_id {task_id!r}")
-            event = record.done
-        event.wait(wait_sec)
-        return self.get_task(task_id, stdout_offset, stderr_offset, max_bytes)
+            event = record.changed
+            baseline_sequence = record.change_sequence
+        snapshot = self.get_task(task_id, stdout_offset, stderr_offset, max_bytes)
+        if (
+            snapshot["status"] in TERMINAL_STATUSES
+            or snapshot["stdout"]["next_offset"] > snapshot["stdout"]["offset"]
+            or snapshot["stderr"]["next_offset"] > snapshot["stderr"]["offset"]
+            or wait_sec == 0
+        ):
+            return snapshot
+        deadline = time.monotonic() + wait_sec
+        while True:
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise TaskError("wait request was cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self.get_task(task_id, stdout_offset, stderr_offset, max_bytes)
+            with self._lock:
+                if record.change_sequence != baseline_sequence:
+                    return self.get_task(task_id, stdout_offset, stderr_offset, max_bytes)
+                event.clear()
+            interval = min(remaining, 0.1) if cancellation_event is not None else remaining
+            event.wait(interval)
 
     # ==========================================
     # Function: List recent task metadata without embedding logs.
@@ -1141,6 +1382,7 @@ class TaskManager:
                 return self._public_record(record)
             record.cancel_requested.set()
             record.status = "cancelling"
+            self._signal_change(record)
             process = record.process
             self._save_record(record)
         if process is not None:
@@ -1195,6 +1437,7 @@ class TaskManager:
             for record in active:
                 record.cancel_requested.set()
                 record.status = "cancelling"
+                self._signal_change(record)
                 self._save_record(record)
             processes = [record.process for record in active if record.process is not None]
         for process in processes:

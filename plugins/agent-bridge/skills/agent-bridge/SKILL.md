@@ -19,11 +19,11 @@ Starting an external agent is an execution side effect. Do it only when the user
 
 ## Receive results
 
-- Prefer `wait_task` with a meaningful bounded wait instead of tight status polling. Reuse the returned `stdout.next_offset` and `stderr.next_offset` for later calls.
+- Prefer `wait_task` with a meaningful bounded wait instead of tight status polling. It may return before terminal completion when output or another task change is available, so reuse the returned `stdout.next_offset` and `stderr.next_offset` for every later call even when the earlier page had no `has_more` bytes.
 - Use `send_followup` when the user wants to continue the same external-agent conversation. Pass the latest terminal task in that session as `parent_task_id`; do not start a fresh task and pretend it retained context. If the alias has no resumable session or the bridge reports a stale/active-session error, explain that boundary.
 - Continue waiting when the user requested a finished result and the task remains queued, running, or cancelling. Keep normal user-facing progress updates during long work.
 - When either stream reports `has_more`, paginate until the relevant output is collected. If `incomplete_utf8_tail` is true on a running task, wait for more output instead of immediately rereading the unchanged offset. A `*_truncated` flag means the configured per-stream storage ceiling was reached; report that limitation rather than inventing missing content.
-- Treat `succeeded` as process success, not proof that the answer or edits are correct. Treat `failed`, `timed_out`, `cancelled`, and `interrupted` as terminal states and include useful stderr/error context.
+- Treat `succeeded` as bridge execution success (zero process exit plus healthy required capture/persistence), not proof that the answer or edits are correct. Treat `failed`, `timed_out`, `cancelled`, and `interrupted` as terminal states and include useful stderr, error, and `persistence_error` context.
 - Preserve `task_kind`, `parent_task_id`, `root_task_id`, `child_task_ids`, `model`, `reasoning_effort`, and `session_id` when summarizing delegated work so the external child-agent chain remains auditable.
 - Use `cancel_task` only when the user asks to cancel, the surrounding authorized workflow requires cleanup, or continuing a task would violate the user's updated direction.
 

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
 import sys
+import threading
 from typing import Any, Callable
 
 from . import __version__
@@ -25,6 +27,7 @@ from .tasks import TaskError, TaskManager
 JSONRPC_VERSION = "2.0"
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = {DEFAULT_PROTOCOL_VERSION}
+MAX_INFLIGHT_WAIT_REQUESTS = 32
 
 
 # ==========================================
@@ -156,7 +159,10 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "wait_task",
-            "description": "Wait up to 50 seconds for task progress or completion, then return metadata and output.",
+            "description": (
+                "Return on unread output, task progress/completion, cancellation, or after waiting "
+                "up to 50 seconds, with current metadata and output."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -379,7 +385,12 @@ class BridgeService:
     # Function: Dispatch one named MCP tool to its typed manager operation.
     # Method: Extract schema-backed arguments and normalize configuration/runtime failures.
     # ==========================================
-    def call_tool(self, name: str, arguments: Any) -> dict[str, Any]:
+    def call_tool(
+        self,
+        name: str,
+        arguments: Any,
+        cancellation_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(arguments, dict):
             return tool_failure("tool arguments must be a JSON object")
         try:
@@ -454,6 +465,7 @@ class BridgeService:
                         stdout_offset=arguments.get("stdout_offset", 0),
                         stderr_offset=arguments.get("stderr_offset", 0),
                         max_bytes=arguments.get("max_bytes", 65536),
+                        cancellation_event=cancellation_event,
                     )
                 )
             if name == "list_tasks":
@@ -497,6 +509,13 @@ class MCPServer:
     def __init__(self, service: BridgeService) -> None:
         self.service = service
         self.initialized = False
+        self._output_lock = threading.Lock()
+        self._inflight_lock = threading.Lock()
+        self._inflight_waits: dict[str, threading.Event] = {}
+        self._wait_executor = ThreadPoolExecutor(
+            max_workers=MAX_INFLIGHT_WAIT_REQUESTS,
+            thread_name_prefix="agent-bridge-wait",
+        )
 
     # ==========================================
     # Function: Construct one JSON-RPC success response.
@@ -519,10 +538,57 @@ class MCPServer:
         }
 
     # ==========================================
+    # Function: Canonicalize one JSON-RPC request ID for in-flight lookup.
+    # Method: Serialize parsed JSON deterministically so string and numeric IDs remain distinct.
+    # ==========================================
+    @staticmethod
+    def _request_key(request_id: Any) -> str:
+        return json.dumps(request_id, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    # ==========================================
+    # Function: Detect a response-bearing wait_task call eligible for asynchronous dispatch.
+    # Method: Inspect only the JSON-RPC envelope and defer full validation to normal handling.
+    # ==========================================
+    @staticmethod
+    def _is_wait_request(value: Any) -> bool:
+        if not isinstance(value, dict) or "id" not in value:
+            return False
+        if value.get("method") != "tools/call":
+            return False
+        params = value.get("params")
+        return isinstance(params, dict) and params.get("name") == "wait_task"
+
+    # ==========================================
+    # Function: Emit one complete JSON-RPC response without cross-thread interleaving.
+    # Method: Serialize before acquiring a dedicated stdout lock and flush the line atomically.
+    # ==========================================
+    def _emit_response(self, response: dict[str, Any]) -> None:
+        encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+        with self._output_lock:
+            print(encoded, flush=True)
+
+    # ==========================================
+    # Function: Cancel one matching in-flight wait request without stopping its provider task.
+    # Method: Correlate the notification requestId and set only the RPC-local cancellation event.
+    # ==========================================
+    def _cancel_wait_request(self, params: Any) -> None:
+        if not isinstance(params, dict) or "requestId" not in params:
+            return
+        key = self._request_key(params["requestId"])
+        with self._inflight_lock:
+            cancellation_event = self._inflight_waits.get(key)
+            if cancellation_event is not None:
+                cancellation_event.set()
+
+    # ==========================================
     # Function: Handle one decoded JSON-RPC message.
     # Method: Route advertised MCP methods and suppress replies for valid notifications.
     # ==========================================
-    def handle(self, message: Any) -> dict[str, Any] | None:
+    def handle(
+        self,
+        message: Any,
+        cancellation_event: threading.Event | None = None,
+    ) -> dict[str, Any] | None:
         if not isinstance(message, dict):
             return self._error(None, -32600, "request must be a JSON object")
         request_id = message.get("id")
@@ -551,7 +617,10 @@ class MCPServer:
             )
         if not self.initialized:
             return None if is_notification else self._error(request_id, -32002, "server is not initialized")
-        if method in {"notifications/initialized", "notifications/cancelled"}:
+        if method == "notifications/initialized":
+            return None
+        if method == "notifications/cancelled":
+            self._cancel_wait_request(params)
             return None
         if method == "ping":
             return None if is_notification else self._success(request_id, {})
@@ -563,36 +632,111 @@ class MCPServer:
             if not isinstance(params, dict) or not isinstance(params.get("name"), str):
                 return self._error(request_id, -32602, "tools/call requires name and object arguments")
             arguments = params.get("arguments", {})
-            return self._success(request_id, self.service.call_tool(params["name"], arguments))
+            return self._success(
+                request_id,
+                self.service.call_tool(
+                    params["name"],
+                    arguments,
+                    cancellation_event=cancellation_event,
+                ),
+            )
         return None if is_notification else self._error(request_id, -32601, f"method not found: {method}")
 
     # ==========================================
     # Function: Process one JSON-RPC value under the MCP no-batch transport rule.
     # Method: Reject arrays as invalid requests and route one object message.
     # ==========================================
-    def process_value(self, value: Any) -> dict[str, Any] | None:
+    def process_value(
+        self,
+        value: Any,
+        cancellation_event: threading.Event | None = None,
+    ) -> dict[str, Any] | None:
         if isinstance(value, list):
             return self._error(None, -32600, "JSON-RPC batching is not supported by MCP")
-        return self.handle(value)
+        return self.handle(value, cancellation_event=cancellation_event)
+
+    # ==========================================
+    # Function: Execute one wait request outside the stdio reader loop.
+    # Method: Reuse normal dispatch, retire its correlation entry, and suppress cancelled replies.
+    # ==========================================
+    def _run_wait_request(
+        self,
+        value: Any,
+        key: str,
+        cancellation_event: threading.Event,
+    ) -> None:
+        try:
+            response = self.process_value(value, cancellation_event=cancellation_event)
+        except Exception as exc:
+            print(f"Agent Bridge internal error: {exc}", file=sys.stderr, flush=True)
+            request_id = value.get("id") if isinstance(value, dict) else None
+            response = self._error(request_id, -32603, "internal error")
+        with self._inflight_lock:
+            self._inflight_waits.pop(key, None)
+            cancelled = cancellation_event.is_set()
+        if not cancelled and response is not None:
+            self._emit_response(response)
+
+    # ==========================================
+    # Function: Admit one asynchronous wait request with bounded concurrency.
+    # Method: Reject duplicate or excessive in-flight IDs before submitting to the wait pool.
+    # ==========================================
+    def _submit_wait_request(self, value: dict[str, Any]) -> None:
+        request_id = value.get("id")
+        key = self._request_key(request_id)
+        rejection: dict[str, Any] | None = None
+        cancellation_event: threading.Event | None = None
+        with self._inflight_lock:
+            if key in self._inflight_waits:
+                rejection = self._error(request_id, -32600, "duplicate in-flight request id")
+            elif len(self._inflight_waits) >= MAX_INFLIGHT_WAIT_REQUESTS:
+                rejection = self._error(request_id, -32000, "too many in-flight wait requests")
+            else:
+                cancellation_event = threading.Event()
+                self._inflight_waits[key] = cancellation_event
+        if rejection is not None:
+            self._emit_response(rejection)
+            return
+        assert cancellation_event is not None
+        try:
+            self._wait_executor.submit(
+                self._run_wait_request,
+                value,
+                key,
+                cancellation_event,
+            )
+        except RuntimeError:
+            with self._inflight_lock:
+                self._inflight_waits.pop(key, None)
+            self._emit_response(self._error(request_id, -32603, "wait dispatcher is unavailable"))
 
     # ==========================================
     # Function: Serve newline-delimited JSON-RPC until stdin closes.
     # Method: Decode each line independently, report parse errors, and flush every response.
     # ==========================================
     def serve(self) -> None:
-        for raw_line in sys.stdin.buffer:
-            if not raw_line.strip():
-                continue
-            try:
-                value = json.loads(raw_line)
-                response = self.process_value(value)
-            except json.JSONDecodeError as exc:
-                response = self._error(None, -32700, f"parse error: {exc.msg}")
-            except Exception as exc:
-                print(f"Agent Bridge internal error: {exc}", file=sys.stderr, flush=True)
-                response = self._error(None, -32603, "internal error")
-            if response is not None:
-                print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
+        try:
+            for raw_line in sys.stdin.buffer:
+                if not raw_line.strip():
+                    continue
+                try:
+                    value = json.loads(raw_line)
+                    if self._is_wait_request(value):
+                        self._submit_wait_request(value)
+                        continue
+                    response = self.process_value(value)
+                except json.JSONDecodeError as exc:
+                    response = self._error(None, -32700, f"parse error: {exc.msg}")
+                except Exception as exc:
+                    print(f"Agent Bridge internal error: {exc}", file=sys.stderr, flush=True)
+                    response = self._error(None, -32603, "internal error")
+                if response is not None:
+                    self._emit_response(response)
+        finally:
+            with self._inflight_lock:
+                for cancellation_event in self._inflight_waits.values():
+                    cancellation_event.set()
+            self._wait_executor.shutdown(wait=True, cancel_futures=True)
 
 
 # ==========================================

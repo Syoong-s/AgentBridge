@@ -6,9 +6,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 
@@ -24,19 +27,83 @@ FAKE_AGENT = REPOSITORY_ROOT / "tests" / "fixtures" / "fake_agent.py"
 # ==========================================
 class MCPStdioTests(unittest.TestCase):
     # ==========================================
+    # Function: Write one JSON-RPC value without waiting for its response.
+    # Method: Serialize one line and flush it to the live MCP server stdin.
+    # ==========================================
+    def write(self, process: subprocess.Popen[str], request: object) -> None:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+
+    # ==========================================
     # Function: Send one request and decode its single response line.
     # Method: Flush JSON to server stdin and require valid object output from stdout.
     # ==========================================
     def send(self, process: subprocess.Popen[str], request: object) -> dict[str, object]:
-        assert process.stdin is not None
         assert process.stdout is not None
-        process.stdin.write(json.dumps(request) + "\n")
-        process.stdin.flush()
+        self.write(process, request)
         line = process.stdout.readline()
         self.assertTrue(line, "MCP server closed stdout before responding")
         response = json.loads(line)
         self.assertIsInstance(response, dict)
         return response
+
+    # ==========================================
+    # Function: Poll one external task to terminal while consuming incremental output.
+    # Method: Advance both stream offsets across progress-aware wait_task responses.
+    # ==========================================
+    def wait_terminal(
+        self,
+        process: subprocess.Popen[str],
+        task_id: str,
+        request_id: int,
+    ) -> dict[str, object]:
+        stdout_offset = 0
+        stderr_offset = 0
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        deadline = time.monotonic() + 8
+        payload: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            payload = self.tool_payload(
+                self.send(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "wait_task",
+                            "arguments": {
+                                "task_id": task_id,
+                                "wait_sec": 1,
+                                "stdout_offset": stdout_offset,
+                                "stderr_offset": stderr_offset,
+                            },
+                        },
+                    },
+                )
+            )
+            request_id += 1
+            stdout = payload["stdout"]
+            stderr = payload["stderr"]
+            self.assertIsInstance(stdout, dict)
+            self.assertIsInstance(stderr, dict)
+            stdout_chunks.append(stdout["text"])
+            stderr_chunks.append(stderr["text"])
+            stdout_offset = stdout["next_offset"]
+            stderr_offset = stderr["next_offset"]
+            if payload["status"] in {
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+                "interrupted",
+            }:
+                stdout["text"] = "".join(stdout_chunks)
+                stderr["text"] = "".join(stderr_chunks)
+                return payload
+        self.fail(f"task did not finish before stdio test deadline: {payload}")
 
     # ==========================================
     # Function: Parse a JSON text content block from a successful tools/call response.
@@ -249,20 +316,7 @@ class MCPStdioTests(unittest.TestCase):
                         },
                     )
                 )
-                completed = self.tool_payload(
-                    self.send(
-                        process,
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 4,
-                            "method": "tools/call",
-                            "params": {
-                                "name": "wait_task",
-                                "arguments": {"task_id": started["task_id"], "wait_sec": 5},
-                            },
-                        },
-                    )
-                )
+                completed = self.wait_terminal(process, started["task_id"], 40)
                 self.assertEqual(completed["status"], "succeeded")
                 self.assertEqual(completed["stdout"]["text"], "roundtrip-result")
                 self.assertEqual(completed["task_kind"], "external_child_agent")
@@ -285,20 +339,7 @@ class MCPStdioTests(unittest.TestCase):
                         },
                     )
                 )
-                followed = self.tool_payload(
-                    self.send(
-                        process,
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 6,
-                            "method": "tools/call",
-                            "params": {
-                                "name": "wait_task",
-                                "arguments": {"task_id": followup["task_id"], "wait_sec": 5},
-                            },
-                        },
-                    )
-                )
+                followed = self.wait_terminal(process, followup["task_id"], 60)
                 self.assertEqual(followed["status"], "succeeded")
                 self.assertEqual(followed["stdout"]["text"], "followup-result")
                 self.assertEqual(followed["parent_task_id"], completed["task_id"])
@@ -308,6 +349,206 @@ class MCPStdioTests(unittest.TestCase):
                 if process.stdin is not None:
                     process.stdin.close()
                 process.wait(timeout=10)
+                if process.returncode != 0:
+                    assert process.stderr is not None
+                    self.fail(process.stderr.read())
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    # ==========================================
+    # Function: Keep stdio responsive during waits and honor request-scoped cancellation.
+    # Method: Interleave wait, ping, cancellation notification, observation, and task cancellation.
+    # ==========================================
+    def test_wait_is_concurrent_and_request_cancellation_preserves_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            work = root / "work"
+            work.mkdir()
+            config_path = root / "config.json"
+            document = {
+                "version": 1,
+                "defaults": {"allowed_work_roots": [str(work)]},
+                "agents": {
+                    "slow": {
+                        "command": [
+                            sys.executable,
+                            str(FAKE_AGENT),
+                            "--sleep",
+                            "10",
+                            "{prompt}",
+                        ],
+                        "prompt_mode": "argument",
+                        "timeout_sec": 20,
+                    }
+                },
+            }
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            environment = dict(os.environ)
+            environment["AGENT_BRIDGE_CONFIG"] = str(config_path)
+            environment["AGENT_BRIDGE_STATE_DIR"] = str(root / "state")
+            process = subprocess.Popen(
+                ["bash", str(START_SCRIPT)],
+                cwd=PLUGIN_ROOT,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            reader: threading.Thread | None = None
+            try:
+                self.send(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {"protocolVersion": "2025-06-18"},
+                    },
+                )
+                started = self.tool_payload(
+                    self.send(
+                        process,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "start_task",
+                                "arguments": {
+                                    "agent": "slow",
+                                    "prompt": "keep-running",
+                                    "cwd": str(work),
+                                },
+                            },
+                        },
+                    )
+                )
+                deadline = time.monotonic() + 2
+                request_id = 3
+                while time.monotonic() < deadline:
+                    current = self.tool_payload(
+                        self.send(
+                            process,
+                            {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "get_task",
+                                    "arguments": {"task_id": started["task_id"]},
+                                },
+                            },
+                        )
+                    )
+                    request_id += 1
+                    if current["status"] == "running":
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail(f"slow task did not start: {current}")
+
+                responses: queue.Queue[dict[str, object]] = queue.Queue()
+
+                # ==========================================
+                # Function: Continuously decode server responses for out-of-order assertions.
+                # Method: Transfer every stdout JSON line into a thread-safe test queue.
+                # ==========================================
+                def collect_responses() -> None:
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        response = json.loads(line)
+                        if isinstance(response, dict):
+                            responses.put(response)
+
+                reader = threading.Thread(target=collect_responses, daemon=True)
+                reader.start()
+                self.write(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 100,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "wait_task",
+                            "arguments": {"task_id": started["task_id"], "wait_sec": 5},
+                        },
+                    },
+                )
+                started_ping = time.monotonic()
+                self.write(process, {"jsonrpc": "2.0", "id": 101, "method": "ping"})
+                ping = responses.get(timeout=1)
+                self.assertEqual(ping["id"], 101)
+                self.assertLess(time.monotonic() - started_ping, 1)
+
+                self.write(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": 100, "reason": "test cancellation"},
+                    },
+                )
+                self.write(process, {"jsonrpc": "2.0", "id": 102, "method": "ping"})
+                self.assertEqual(responses.get(timeout=1)["id"], 102)
+                with self.assertRaises(queue.Empty):
+                    responses.get(timeout=0.3)
+
+                self.write(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 103,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "get_task",
+                            "arguments": {"task_id": started["task_id"]},
+                        },
+                    },
+                )
+                current = self.tool_payload(responses.get(timeout=1))
+                self.assertEqual(current["status"], "running")
+
+                self.write(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 104,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "wait_task",
+                            "arguments": {"task_id": started["task_id"], "wait_sec": 5},
+                        },
+                    },
+                )
+                self.write(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 105,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "cancel_task",
+                            "arguments": {"task_id": started["task_id"]},
+                        },
+                    },
+                )
+                received: dict[object, dict[str, object]] = {}
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and set(received) != {104, 105}:
+                    response = responses.get(timeout=max(0.1, deadline - time.monotonic()))
+                    received[response["id"]] = response
+                self.assertEqual(set(received), {104, 105})
+                cancelled = self.tool_payload(received[105])
+                self.assertIn(cancelled["status"], {"cancelling", "cancelled"})
+            finally:
+                if process.stdin is not None:
+                    process.stdin.close()
+                process.wait(timeout=10)
+                if reader is not None:
+                    reader.join(timeout=2)
                 if process.returncode != 0:
                     assert process.stderr is not None
                     self.fail(process.stderr.read())

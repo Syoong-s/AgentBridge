@@ -10,8 +10,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +106,11 @@ class TaskManagerTests(unittest.TestCase):
                 "prompt_mode": "argument",
                 "environment": {"BRIDGE_VALUE": "task-{task_id}"},
             },
+            "pwd": {
+                "command": [python, fake, "--environment", "PWD", "{prompt}"],
+                "prompt_mode": "argument",
+                "environment": {"PWD": "/configured/value/must/not/win"},
+            },
             "tree": {
                 "command": [
                     python,
@@ -133,6 +140,21 @@ class TaskManagerTests(unittest.TestCase):
                 "command": [
                     python,
                     fake,
+                    "--early-output",
+                    "ready|",
+                    "--sleep",
+                    "10",
+                    "{prompt}",
+                ],
+                "prompt_mode": "argument",
+                "timeout_sec": 20,
+            },
+            "delayed-streaming": {
+                "command": [
+                    python,
+                    fake,
+                    "--before-output-sleep",
+                    "0.3",
                     "--early-output",
                     "ready|",
                     "--sleep",
@@ -493,6 +515,94 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(result["stderr"]["text"], "expected-error")
 
     # ==========================================
+    # Function: Refuse success when asynchronous output capture crashes.
+    # Method: Inject drain failures and require a contained failed task with explicit evidence.
+    # ==========================================
+    def test_capture_worker_failure_fails_task(self) -> None:
+        manager = self.make_manager()
+        with mock.patch.object(manager, "_drain_stream", side_effect=OSError("capture-boom")):
+            started = manager.start_task("argument", "lost-output", str(self.work))
+            result = self.wait_terminal(manager, started["task_id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["return_code"], 0)
+        self.assertIn("could not capture agent output", result["error"])
+        self.assertIn("capture-boom", result["error"])
+        self.assertTrue(result["stdout_truncated"])
+
+    # ==========================================
+    # Function: Persist a conservative failure when the first terminal metadata write fails.
+    # Method: Fault-inject one success-state save, then verify the retry on disk and in memory.
+    # ==========================================
+    def test_terminal_persistence_failure_is_reported_and_retried(self) -> None:
+        manager = self.make_manager()
+        original_save = manager._save_record
+        injected = False
+
+        # ==========================================
+        # Function: Fail exactly the first attempted succeeded-state persistence.
+        # Method: Delegate every other record write to the real atomic implementation.
+        # ==========================================
+        def fail_first_success(record: object) -> None:
+            nonlocal injected
+            if getattr(record, "status") == "succeeded" and not injected:
+                injected = True
+                raise OSError("metadata-disk-boom")
+            original_save(record)  # type: ignore[arg-type]
+
+        with mock.patch.object(manager, "_save_record", side_effect=fail_first_success):
+            started = manager.start_task("argument", "result", str(self.work))
+            result = self.wait_terminal(manager, started["task_id"])
+        self.assertTrue(injected)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("terminal metadata persistence failed", result["error"])
+        self.assertIn("metadata-disk-boom", result["persistence_error"])
+        persisted = json.loads(
+            (self.state / started["task_id"] / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["persistence_error"], result["persistence_error"])
+
+    # ==========================================
+    # Function: Finish the worker safely when terminal storage remains unavailable.
+    # Method: Fail both terminal writes, inspect memory, and verify conservative restart recovery.
+    # ==========================================
+    def test_repeated_terminal_persistence_failure_does_not_escape_worker(self) -> None:
+        manager = self.make_manager()
+        original_save = manager._save_record
+
+        # ==========================================
+        # Function: Reject every terminal-state write while preserving queued/running metadata.
+        # Method: Identify terminal attempts by status and delegate all earlier lifecycle saves.
+        # ==========================================
+        def fail_terminal_writes(record: object) -> None:
+            if getattr(record, "status") in {
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+                "interrupted",
+            }:
+                raise OSError("metadata-still-unavailable")
+            original_save(record)  # type: ignore[arg-type]
+
+        with mock.patch.object(manager, "_save_record", side_effect=fail_terminal_writes):
+            started = manager.start_task("argument", "result", str(self.work))
+            result = self.wait_terminal(manager, started["task_id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("persistence retry failed", result["persistence_error"])
+        with manager._lock:
+            worker = manager._tasks[started["task_id"]].worker
+        assert worker is not None
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        persisted = json.loads(
+            (self.state / started["task_id"] / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["status"], "running")
+        recovered = self.make_manager(state=self.state)
+        self.assertEqual(recovered.get_task(started["task_id"])["status"], "interrupted")
+
+    # ==========================================
     # Function: Enforce timeout and explicit cancellation terminal states.
     # Method: Exercise both manager deadline termination and a caller-issued cancellation.
     # ==========================================
@@ -672,6 +782,64 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(self.wait_terminal(manager, started["task_id"])["status"], "cancelled")
 
     # ==========================================
+    # Function: Wake wait_task as soon as newly flushed provider output is readable.
+    # Method: Begin from a quiet running task and measure return before its long sleep completes.
+    # ==========================================
+    def test_wait_task_returns_on_stream_progress(self) -> None:
+        manager = self.make_manager()
+        started = manager.start_task("delayed-streaming", "later", str(self.work))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            current = manager.get_task(started["task_id"])
+            if current["status"] == "running" and not current["stdout"]["text"]:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail(f"task did not reach quiet running state: {current}")
+        started_wait = time.monotonic()
+        result = manager.wait_task(started["task_id"], wait_sec=3)
+        elapsed = time.monotonic() - started_wait
+        self.assertLess(elapsed, 2)
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["stdout"]["text"], "ready|")
+        manager.cancel_task(started["task_id"])
+        self.assertEqual(self.wait_terminal(manager, started["task_id"])["status"], "cancelled")
+
+    # ==========================================
+    # Function: Cancel one manager wait without cancelling its durable provider task.
+    # Method: Set an RPC-local event during a quiet run and inspect the still-running record.
+    # ==========================================
+    def test_wait_request_cancellation_does_not_cancel_task(self) -> None:
+        manager = self.make_manager()
+        started = manager.start_task("slow", "keep-running", str(self.work))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            current = manager.get_task(started["task_id"])
+            if current["status"] == "running":
+                break
+            time.sleep(0.01)
+        else:
+            self.fail(f"task did not start: {current}")
+        cancellation_event = threading.Event()
+        timer = threading.Timer(0.1, cancellation_event.set)
+        timer.start()
+        started_wait = time.monotonic()
+        try:
+            with self.assertRaisesRegex(TaskError, "wait request was cancelled"):
+                manager.wait_task(
+                    started["task_id"],
+                    wait_sec=5,
+                    cancellation_event=cancellation_event,
+                )
+        finally:
+            timer.cancel()
+            timer.join()
+        self.assertLess(time.monotonic() - started_wait, 1)
+        self.assertEqual(manager.get_task(started["task_id"])["status"], "running")
+        manager.cancel_task(started["task_id"])
+        self.assertEqual(self.wait_terminal(manager, started["task_id"])["status"], "cancelled")
+
+    # ==========================================
     # Function: Clean up same-group background descendants when the CLI leader exits.
     # Method: Let the fake parent return zero, then require terminal success and a dead child.
     # ==========================================
@@ -720,6 +888,17 @@ class TaskManagerTests(unittest.TestCase):
             result["stdout"]["text"],
             f"task-{started['task_id']}|payload",
         )
+
+    # ==========================================
+    # Function: Keep the inherited PWD environment consistent with the real child cwd.
+    # Method: Override a conflicting alias value and compare the child report to resolved cwd.
+    # ==========================================
+    def test_pwd_environment_matches_resolved_task_cwd(self) -> None:
+        manager = self.make_manager()
+        started = manager.start_task("pwd", "payload", str(self.work))
+        result = self.wait_terminal(manager, started["task_id"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["stdout"]["text"], f"{self.work.resolve()}|payload")
 
     # ==========================================
     # Function: Mark stale running metadata interrupted on server restart.

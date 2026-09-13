@@ -18,7 +18,7 @@ CLI flag 被误当成提示词。
 - agent 别名和启动指令完全由一个 JSON 参数文件控制；
 - 将统一的模型名和思考等级映射为每个 CLI 专属的 argv；
 - 支持参数、stdin、临时提示词文件三种传递模式；
-- 支持异步任务、有界等待、分页日志和持久化元数据；
+- 支持异步任务、进度感知的并发等待、分页日志和持久化元数据；
 - 支持父任务/根任务关系、provider 会话续接和 follow-up；
 - 支持并发限制、超时、POSIX 进程组取消和服务重启恢复；
 - 支持工作目录白名单、别名级环境变量和额外参数策略；
@@ -97,7 +97,7 @@ cp plugins/agent-bridge/config/agents.example.json \
 | `command` | 非空 argv 字符串数组，不进行 shell 解析 |
 | `prompt_mode` | `argument`、`stdin` 或 `file` |
 | `inherit_env` | 是否继承 MCP server 环境，再叠加 `environment` |
-| `environment` | 支持占位符的静态环境变量映射 |
+| `environment` | 支持占位符的静态环境变量映射；任务 `PWD` 由桥接层管理 |
 | `timeout_sec` | 该别名的默认超时 |
 | `max_output_bytes` | 每个输出流的存储上限，1 KiB–100 MiB |
 | `allow_extra_args` | 是否允许在固定命令后附加独立的运行时 argv 项 |
@@ -109,6 +109,10 @@ cp plugins/agent-bridge/config/agents.example.json \
 `argument` 模式必须恰好包含一个 `{prompt}`；`file` 模式必须恰好包含一个
 `{prompt_file}`，并在任务结束后删除私有临时文件；`stdin` 模式不能包含这两个提示词
 占位符。`command[0]` 不允许包含提示词占位符。
+
+为使环境变量与真实的 `Popen(cwd=...)` 工作目录一致，AgentBridge 会在继承并合并别名
+环境变量后，把子进程的 `PWD` 强制设置为解析后的任务 cwd。因此，配置中的
+`environment.PWD` 会被有意覆盖。
 
 ### 模型名与思考等级
 
@@ -174,13 +178,15 @@ shell。
 | `start_task` | `start_child_agent` 的向后兼容别名 |
 | `send_followup` | 续接最新 provider 会话，生成新的关联子任务 |
 | `get_task` | 不等待，读取当前元数据和分页输出 |
-| `wait_task` | 最多等待 50 秒，再返回元数据和输出 |
+| `wait_task` | 在出现未读输出、进度/完成、取消或最长 50 秒到期时返回 |
 | `list_tasks` | 列出最近任务，可按状态过滤 |
 | `cancel_task` | 幂等取消一个活动进程组 |
 
 任务状态包括 `queued`、`running`、`cancelling`、`succeeded`、`failed`、
-`timed_out`、`cancelled` 和 `interrupted`。`succeeded` 只表示进程返回码为零，
-Codex 仍需核实重要结论和工作区改动。
+`timed_out`、`cancelled` 和 `interrupted`。`succeeded` 表示进程返回码为零，而且必要的
+输出捕获和终态元数据持久化均正常完成；Codex 仍需核实重要结论和工作区改动。
+若出现 `persistence_error`，说明终态元数据写入失败，内存中的结果已保守地改为
+`failed`。
 
 每个任务都会报告 `task_kind: external_child_agent`、`parent_task_id`、
 `root_task_id`、`child_task_ids`、`invocation`、桥接层解析的 `model`/
@@ -190,6 +196,11 @@ Codex 仍需核实重要结论和工作区改动。
 输出按字节偏移分页；当 `has_more` 为 true 时继续使用该流的 `next_offset`。出现
 运行中任务的 `incomplete_utf8_tail` 为 true 时，应等待外部进程写完多字节字符后再读。
 出现 `stdout_truncated` 或 `stderr_truncated` 表示达到了配置的存储上限。
+
+当出现输出或其他任务变化时，`wait_task` 可以在任务进入终态前返回。后续调用应复用
+两个流返回的 `next_offset`，并在状态仍非终态时继续等待。MCP
+`notifications/cancelled` 只停止对应的等待响应，不会终止持久存在的外部任务；如需
+结束 provider 进程，应显式调用 `cancel_task`。
 
 ## 状态与安全边界
 

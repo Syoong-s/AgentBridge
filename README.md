@@ -19,7 +19,7 @@ flag is not consumed as the prompt.
 - aliases and launch commands controlled by one JSON parameter file;
 - first-class model names and reasoning-effort levels mapped to provider-specific argv;
 - argument, stdin, and temporary prompt-file transport modes;
-- asynchronous tasks with bounded waits, paginated logs, and persistent metadata;
+- asynchronous tasks with progress-aware concurrent waits, paginated logs, and persistent metadata;
 - parent/root task lineage plus resumable provider sessions and follow-up turns;
 - concurrency limits, timeouts, cancellation of isolated POSIX process groups, and
   restart recovery;
@@ -140,7 +140,7 @@ provider in production. Example:
 | `command` | Non-empty argv string array; no shell parsing occurs |
 | `prompt_mode` | `argument`, `stdin`, or `file` |
 | `inherit_env` | Inherit the MCP server environment before applying `environment` |
-| `environment` | Static environment values with supported placeholders |
+| `environment` | Static environment values with supported placeholders; task `PWD` is bridge-owned |
 | `timeout_sec` | Alias-specific default timeout |
 | `max_output_bytes` | Per-stream persisted byte ceiling, 1 KiB to 100 MiB |
 | `allow_extra_args` | Permit discrete runtime argv items after the configured command |
@@ -153,6 +153,11 @@ Argument mode requires exactly one `{prompt}`. File mode requires exactly one
 `{prompt_file}` and deletes that private temporary file after the task. Stdin mode must
 not contain either prompt placeholder. Prompt placeholders are forbidden in
 `command[0]`.
+
+For consistency with the real `Popen(cwd=...)` directory, AgentBridge always sets the
+child's `PWD` environment value to the resolved task cwd after inherited and alias
+environment values are merged. A configured `environment.PWD` value is therefore
+intentionally overridden.
 
 ### Model and reasoning mappings
 
@@ -224,13 +229,15 @@ The skill guides Codex through these MCP tools:
 | `start_task` | Backward-compatible alias of `start_child_agent` |
 | `send_followup` | Resume the latest provider session as a new linked child task |
 | `get_task` | Read current metadata and paginated output without waiting |
-| `wait_task` | Wait for up to 50 seconds, then return current metadata and output |
+| `wait_task` | Return on unread output/progress/completion, cancellation, or a wait of up to 50 seconds |
 | `list_tasks` | List recent task metadata, optionally filtered by status |
 | `cancel_task` | Idempotently cancel one active process group |
 
 Task states are `queued`, `running`, `cancelling`, `succeeded`, `failed`, `timed_out`,
-`cancelled`, and `interrupted`. `succeeded` means the process returned zero; Codex still
-must verify consequential claims and workspace edits.
+`cancelled`, and `interrupted`. `succeeded` means the process returned zero and required
+output capture plus terminal metadata persistence completed normally; Codex still must
+verify consequential claims and workspace edits. A `persistence_error` value explains a
+terminal metadata failure that conservatively changed the in-memory result to `failed`.
 
 Every task reports `task_kind: external_child_agent`, `parent_task_id`, `root_task_id`,
 `child_task_ids`, `invocation`, bridge-resolved `model`/`reasoning_effort`, and `session_id`
@@ -241,6 +248,12 @@ Output is paginated by byte offsets. Follow each stream's `next_offset` while `h
 is true. On a running task, `incomplete_utf8_tail` asks the caller to wait until the
 external process emits the rest of a multibyte character. A `stdout_truncated` or
 `stderr_truncated` flag means the configured storage ceiling was reached.
+
+`wait_task` can return before terminal completion when output or another task change is
+available. Reuse both returned `next_offset` values and call it again while status remains
+nonterminal. MCP `notifications/cancelled` stops only the matching in-flight wait response;
+it deliberately leaves the durable external task running. Use `cancel_task` when the
+provider process itself should be terminated.
 
 ## State and security
 

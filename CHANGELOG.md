@@ -2,6 +2,14 @@
 
 All notable changes to AgentBridge are documented here.
 
+## 0.2.2 - 2026-09-13
+
+- Fail tasks when stdout/stderr capture is unhealthy instead of accepting a zero process exit.
+- Make terminal metadata persistence conservative, diagnostic, retried, and worker-safe.
+- Return waits on incremental progress while keeping stdio responsive to ping and cancellation.
+- Treat MCP request cancellation as wait-local and keep provider termination explicit.
+- Synchronize each child's `PWD` environment value with its resolved task working directory.
+
 ## 0.2.1 - 2026-09-10
 
 - Attach the Antigravity prompt directly to `-p` so CLI flags cannot be consumed as
