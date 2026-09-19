@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source ~/.bashrc >/dev/null 2>&1
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 python_bin="${AGENT_BRIDGE_PYTHON:-python3}"
 

@@ -9,4 +9,4 @@ dependencies:
       value: "agent-bridge"
       description: "Local stdio MCP bridge for configurable external agent CLIs"
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

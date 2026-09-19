@@ -2,6 +2,13 @@
 
 All notable changes to AgentBridge are documented here.
 
+## Unreleased
+
+- Reduce the advertised MCP surface from nine tools to five unified tools.
+- Make task status and agent discovery compact by default; output and diagnostics are opt-in.
+- Add bounded public log reads, lifecycle-only waits, and compact JSON tool responses.
+- Disable implicit skill invocation and retain the former RPC names only as compatibility aliases.
+
 ## 0.2.2 - 2026-09-13
 
 - Fail tasks when stdout/stderr capture is unhealthy instead of accepting a zero process exit.

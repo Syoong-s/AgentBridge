@@ -189,16 +189,28 @@ class MCPStdioTests(unittest.TestCase):
                     names,
                     {
                         "list_agents",
-                        "reload_config",
-                        "start_child_agent",
-                        "start_task",
-                        "send_followup",
-                        "get_task",
-                        "wait_task",
+                        "run_agent",
+                        "task_status",
                         "list_tasks",
                         "cancel_task",
                     },
                 )
+                compact_agents = self.tool_payload(
+                    self.send(
+                        process,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 20,
+                            "method": "tools/call",
+                            "params": {"name": "list_agents", "arguments": {}},
+                        },
+                    )
+                )
+                self.assertEqual(
+                    set(compact_agents["agents"][0]),
+                    {"alias", "available", "enabled", "followup", "efforts"},
+                )
+                self.assertNotIn("config_path", compact_agents)
                 invalid = self.send(
                     process,
                     {
@@ -246,7 +258,10 @@ class MCPStdioTests(unittest.TestCase):
                             "jsonrpc": "2.0",
                             "id": 22,
                             "method": "tools/call",
-                            "params": {"name": "reload_config", "arguments": {}},
+                            "params": {
+                                "name": "list_agents",
+                                "arguments": {"refresh": True},
+                            },
                         },
                     )
                 )
@@ -272,7 +287,10 @@ class MCPStdioTests(unittest.TestCase):
                             "jsonrpc": "2.0",
                             "id": 25,
                             "method": "tools/call",
-                            "params": {"name": "list_agents", "arguments": {}},
+                            "params": {
+                                "name": "list_agents",
+                                "arguments": {"detail": True},
+                            },
                         },
                     )
                 )
@@ -304,7 +322,7 @@ class MCPStdioTests(unittest.TestCase):
                             "id": 3,
                             "method": "tools/call",
                             "params": {
-                                "name": "start_task",
+                                "name": "run_agent",
                                 "arguments": {
                                     "agent": "fake",
                                     "prompt": "roundtrip-result",
@@ -330,9 +348,9 @@ class MCPStdioTests(unittest.TestCase):
                             "id": 5,
                             "method": "tools/call",
                             "params": {
-                                "name": "send_followup",
+                                "name": "run_agent",
                                 "arguments": {
-                                    "parent_task_id": completed["task_id"],
+                                    "resume_task_id": completed["task_id"],
                                     "prompt": "followup-result",
                                 },
                             },
@@ -345,6 +363,80 @@ class MCPStdioTests(unittest.TestCase):
                 self.assertEqual(followed["parent_task_id"], completed["task_id"])
                 self.assertEqual(followed["root_task_id"], completed["task_id"])
                 self.assertEqual(followed["session_id"], completed["session_id"])
+
+                compact_status = self.tool_payload(
+                    self.send(
+                        process,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 6,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "task_status",
+                                "arguments": {
+                                    "task_id": completed["task_id"],
+                                    "wait_sec": 0,
+                                },
+                            },
+                        },
+                    )
+                )
+                self.assertEqual(compact_status["status"], "succeeded")
+                self.assertNotIn("stdout", compact_status)
+                self.assertNotIn("stderr", compact_status)
+                bounded_status = self.tool_payload(
+                    self.send(
+                        process,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 7,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "task_status",
+                                "arguments": {
+                                    "task_id": completed["task_id"],
+                                    "wait_sec": 0,
+                                    "include_output": True,
+                                    "max_bytes": 64,
+                                },
+                            },
+                        },
+                    )
+                )
+                self.assertEqual(bounded_status["stdout"]["text"], "roundtrip-result")
+                oversized_status = self.send(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 8,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "task_status",
+                            "arguments": {
+                                "task_id": completed["task_id"],
+                                "include_output": True,
+                                "max_bytes": 16385,
+                            },
+                        },
+                    },
+                )
+                self.assertTrue(oversized_status["result"]["isError"])
+                compact_tasks = self.tool_payload(
+                    self.send(
+                        process,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 9,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "list_tasks",
+                                "arguments": {},
+                            },
+                        },
+                    )
+                )
+                self.assertTrue(compact_tasks["tasks"])
+                self.assertNotIn("invocation", compact_tasks["tasks"][0])
             finally:
                 if process.stdin is not None:
                     process.stdin.close()

@@ -28,193 +28,96 @@ JSONRPC_VERSION = "2.0"
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = {DEFAULT_PROTOCOL_VERSION}
 MAX_INFLIGHT_WAIT_REQUESTS = 32
+DEFAULT_OUTPUT_BYTES = 4096
+MAX_PUBLIC_OUTPUT_BYTES = 16384
 
 
 # ==========================================
 # Function: Define the MCP tools exposed to Codex.
-# Method: Return strict JSON schemas for configuration, launch, observation, wait, and cancellation.
+# Method: Return compact schemas; server-side validation handles mode-specific launch rules.
 # ==========================================
 def tool_definitions() -> list[dict[str, Any]]:
-    task_read_properties = {
-        "task_id": {
-            "type": "string",
-            "description": "External child-agent task identifier returned by a launch tool.",
-        },
-        "stdout_offset": {
-            "type": "integer",
-            "minimum": 0,
-            "default": 0,
-            "description": "UTF-8 byte offset for the next stdout segment.",
-        },
-        "stderr_offset": {
-            "type": "integer",
-            "minimum": 0,
-            "default": 0,
-            "description": "UTF-8 byte offset for the next stderr segment.",
-        },
+    """Return the compact public MCP surface while keeping legacy calls server-side."""
+    launch_properties = {
+        "agent": {"type": "string"},
+        "prompt": {"type": "string"},
+        "cwd": {"type": "string"},
+        "model": {"type": "string"},
+        "reasoning_effort": {"type": "string"},
+        "parent_task_id": {"type": "string"},
+        "resume_task_id": {"type": "string"},
+        "extra_args": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+        "timeout_sec": {"type": "integer", "minimum": 1},
+    }
+    task_status_properties = {
+        "task_id": {"type": "string"},
+        "wait_sec": {"type": "integer", "minimum": 0, "maximum": 50, "default": 30},
+        "include_output": {"type": "boolean", "default": False},
+        "stdout_offset": {"type": "integer", "minimum": 0, "default": 0},
+        "stderr_offset": {"type": "integer", "minimum": 0, "default": 0},
         "max_bytes": {
             "type": "integer",
             "minimum": 4,
-            "maximum": 262144,
-            "default": 65536,
-            "description": "Maximum bytes returned from each stream.",
-        },
-    }
-    launch_properties = {
-        "agent": {"type": "string", "description": "Configured external-agent alias."},
-        "prompt": {"type": "string", "description": "Task prompt sent through the configured mode."},
-        "cwd": {
-            "type": "string",
-            "description": "Explicit existing working directory for the external child agent.",
-        },
-        "model": {
-            "type": "string",
-            "description": "Optional model alias/name mapped through this agent's parameter configuration.",
-        },
-        "reasoning_effort": {
-            "type": "string",
-            "description": "Optional thinking/effort level mapped and validated by this agent alias.",
-        },
-        "parent_task_id": {
-            "type": "string",
-            "description": "Optional Agent Bridge parent task for external child-agent lineage only.",
-        },
-        "extra_args": {
-            "type": "array",
-            "items": {"type": "string"},
-            "maxItems": 64,
-            "description": "Optional discrete argv items when the alias allows them.",
-        },
-        "timeout_sec": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "Optional timeout capped by the global configuration.",
+            "maximum": 16384,
+            "default": DEFAULT_OUTPUT_BYTES,
         },
     }
     return [
         {
             "name": "list_agents",
-            "description": "List configured external-agent aliases, launch modes, limits, and executable availability.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-        {
-            "name": "reload_config",
-            "description": "Re-read and validate the active Agent Bridge JSON parameter file for future tasks.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-        {
-            "name": "start_child_agent",
-            "description": (
-                "Start a plugin-managed external child-agent task with optional model, "
-                "reasoning effort, and lineage, then return its task ID."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": launch_properties,
-                "required": ["agent", "prompt", "cwd"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "start_task",
-            "description": (
-                "Backward-compatible alias of start_child_agent for launching an external CLI task."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": launch_properties,
-                "required": ["agent", "prompt", "cwd"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "send_followup",
-            "description": (
-                "Resume the latest terminal provider session as a new linked external child-agent task."
-            ),
+            "description": "List available external agents.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "parent_task_id": {
-                        "type": "string",
-                        "description": "Latest terminal task in the provider session to resume.",
-                    },
-                    "prompt": {"type": "string", "description": "Follow-up instruction."},
-                    "extra_args": launch_properties["extra_args"],
-                    "timeout_sec": launch_properties["timeout_sec"],
+                    "detail": {"type": "boolean", "default": False},
+                    "refresh": {"type": "boolean", "default": False},
                 },
-                "required": ["parent_task_id", "prompt"],
                 "additionalProperties": False,
             },
         },
         {
-            "name": "get_task",
-            "description": "Read external child-agent metadata, lineage, and paginated output without waiting.",
+            "name": "run_agent",
+            "description": "Start an external agent, or resume one with resume_task_id.",
             "inputSchema": {
                 "type": "object",
-                "properties": task_read_properties,
-                "required": ["task_id"],
+                "properties": launch_properties,
+                "required": ["prompt"],
                 "additionalProperties": False,
             },
         },
         {
-            "name": "wait_task",
-            "description": (
-                "Return on unread output, task progress/completion, cancellation, or after waiting "
-                "up to 50 seconds, with current metadata and output."
-            ),
+            "name": "task_status",
+            "description": "Wait for a task and return compact status; request output explicitly.",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    **task_read_properties,
-                    "wait_sec": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 50,
-                        "default": 30,
-                        "description": "Maximum server-side wait interval.",
-                    },
-                },
+                "properties": task_status_properties,
                 "required": ["task_id"],
                 "additionalProperties": False,
             },
         },
         {
             "name": "list_tasks",
-            "description": "List recent external child-agent task metadata and lineage.",
+            "description": "List recent tasks with compact metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                     "statuses": {
                         "type": "array",
-                        "items": {
-                            "type": "string",
-                            "enum": [
-                                "queued",
-                                "running",
-                                "cancelling",
-                                "succeeded",
-                                "failed",
-                                "timed_out",
-                                "cancelled",
-                                "interrupted",
-                            ],
-                        },
+                        "items": {"type": "string"},
                         "uniqueItems": True,
                     },
+                    "detail": {"type": "boolean", "default": False},
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "cancel_task",
-            "description": "Idempotently cancel one active external-agent process group.",
+            "description": "Cancel an active external-agent task.",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "Task identifier to cancel."}
-                },
+                "properties": {"task_id": {"type": "string"}},
                 "required": ["task_id"],
                 "additionalProperties": False,
             },
@@ -227,11 +130,12 @@ def tool_definitions() -> list[dict[str, Any]]:
 # Method: Preserve structured values inside one portable text content block.
 # ==========================================
 def tool_success(value: dict[str, Any]) -> dict[str, Any]:
+    """Serialize successful tool data without whitespace overhead."""
     return {
         "content": [
             {
                 "type": "text",
-                "text": json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
+                "text": json.dumps(value, ensure_ascii=False, separators=(",", ":")),
             }
         ],
         "isError": False,
@@ -244,6 +148,47 @@ def tool_success(value: dict[str, Any]) -> dict[str, Any]:
 # ==========================================
 def tool_failure(message: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": message}], "isError": True}
+
+
+# ==========================================
+# Function: Reduce task data before returning it to the model.
+# Method: Preserve identifiers, lifecycle state, and diagnostics while omitting repeated metadata.
+# ==========================================
+def compact_task(value: dict[str, Any], include_output: bool = False) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in ("task_id", "status", "agent"):
+        if key in value:
+            result[key] = value[key]
+    for key in ("model", "reasoning_effort", "return_code", "error"):
+        if value.get(key) is not None:
+            result[key] = value[key]
+    if include_output:
+        for key in ("stdout", "stderr"):
+            if key in value:
+                result[key] = value[key]
+    return result
+
+
+# ==========================================
+# Function: Reduce task history to compact entries.
+# Method: Keep only fields useful for selecting or diagnosing a task from a list.
+# ==========================================
+def compact_task_list(value: dict[str, Any], detail: bool = False) -> dict[str, Any]:
+    if detail:
+        return value
+    tasks = []
+    for record in value.get("tasks", []):
+        item = {
+            key: record[key]
+            for key in ("task_id", "agent", "status", "created_at", "finished_at", "return_code", "error")
+            if record.get(key) is not None
+        }
+        tasks.append(item)
+    return {
+        "tasks": tasks,
+        "returned": value.get("returned", len(tasks)),
+        "matching": value.get("matching", len(tasks)),
+    }
 
 
 # ==========================================
@@ -338,27 +283,47 @@ class BridgeService:
     # Function: Return public configuration and alias availability.
     # Method: Omit configured environment values and full command arguments that may be sensitive.
     # ==========================================
-    def list_agents(self) -> dict[str, Any]:
+    def list_agents(self, detail: bool = False) -> dict[str, Any]:
+        """Return a compact alias summary unless detailed diagnostics are requested."""
         config = self.manager.config
         agents = []
         for alias in sorted(config.agents):
             agent = config.agents[alias]
+            executable = executable_status(agent)
+            if detail:
+                agents.append(
+                    {
+                        "alias": alias,
+                        "description": agent.description,
+                        "enabled": agent.enabled,
+                        "prompt_mode": agent.prompt_mode,
+                        "timeout_sec": agent.timeout_sec,
+                        "max_output_bytes_per_stream": agent.max_output_bytes,
+                        "allow_extra_args": agent.allow_extra_args,
+                        "task_kind": "external_child_agent",
+                        "model": selection_status(agent.model),
+                        "reasoning_effort": selection_status(agent.reasoning_effort),
+                        "supports_followup": agent.session is not None,
+                        "executable": executable,
+                    }
+                )
+                continue
             agents.append(
                 {
                     "alias": alias,
-                    "description": agent.description,
+                    "available": executable["available"],
                     "enabled": agent.enabled,
-                    "prompt_mode": agent.prompt_mode,
-                    "timeout_sec": agent.timeout_sec,
-                    "max_output_bytes_per_stream": agent.max_output_bytes,
-                    "allow_extra_args": agent.allow_extra_args,
-                    "task_kind": "external_child_agent",
-                    "model": selection_status(agent.model),
-                    "reasoning_effort": selection_status(agent.reasoning_effort),
-                    "supports_followup": agent.session is not None,
-                    "executable": executable_status(agent),
+                    "followup": agent.session is not None,
+                    "efforts": (
+                        list(agent.reasoning_effort.allowed_values)
+                        if agent.reasoning_effort is not None
+                        and agent.reasoning_effort.allowed_values is not None
+                        else None
+                    ),
                 }
             )
+        if not detail:
+            return {"agents": agents}
         return {
             "config_path": str(config.path),
             "state_dir": str(config.state_dir),
@@ -370,20 +335,98 @@ class BridgeService:
         }
 
     # ==========================================
-    # Function: Reload the same active parameter file for future launches.
-    # Method: Fully validate a new immutable snapshot before replacing manager configuration.
+    # Function: Reload the active parameter file and return diagnostics for compatibility callers.
+    # Method: Replace the validated immutable snapshot while preserving the running state directory.
     # ==========================================
     def reload_config(self) -> dict[str, Any]:
         current = self.manager.config
         updated = load_config(current.path, state_dir=current.state_dir)
         self.manager.replace_config(updated)
-        result = self.list_agents()
+        result = self.list_agents(detail=True)
         result["reloaded"] = True
         return result
 
     # ==========================================
+    # Function: Launch one public run_agent request.
+    # Method: Select a new task or a resumable follow-up and return only compact launch metadata.
+    # ==========================================
+    def run_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if "resume_task_id" in arguments:
+            validate_tool_arguments(
+                arguments,
+                {"resume_task_id", "prompt"},
+                {"extra_args", "timeout_sec"},
+            )
+            result = self.manager.send_followup(
+                parent_task_id=arguments["resume_task_id"],
+                prompt=arguments["prompt"],
+                extra_args=arguments.get("extra_args"),
+                timeout_sec=arguments.get("timeout_sec"),
+            )
+        else:
+            validate_tool_arguments(
+                arguments,
+                {"agent", "prompt", "cwd"},
+                {"extra_args", "timeout_sec", "model", "reasoning_effort", "parent_task_id"},
+            )
+            result = self.manager.start_task(
+                alias=arguments["agent"],
+                prompt=arguments["prompt"],
+                cwd=arguments["cwd"],
+                extra_args=arguments.get("extra_args"),
+                timeout_sec=arguments.get("timeout_sec"),
+                model=arguments.get("model"),
+                reasoning_effort=arguments.get("reasoning_effort"),
+                parent_task_id=arguments.get("parent_task_id"),
+            )
+        return compact_task(result)
+
+    # ==========================================
+    # Function: Observe one public task_status request.
+    # Method: Wait for lifecycle changes and include logs only when explicitly requested.
+    # ==========================================
+    def task_status(
+        self,
+        arguments: dict[str, Any],
+        cancellation_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        validate_tool_arguments(
+            arguments,
+            {"task_id"},
+            {
+                "wait_sec",
+                "include_output",
+                "stdout_offset",
+                "stderr_offset",
+                "max_bytes",
+            },
+        )
+        include_output = arguments.get("include_output", False)
+        if not isinstance(include_output, bool):
+            raise TaskError("include_output must be a boolean")
+        max_bytes = arguments.get("max_bytes", DEFAULT_OUTPUT_BYTES)
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 4 <= max_bytes <= MAX_PUBLIC_OUTPUT_BYTES
+        ):
+            raise TaskError(
+                f"max_bytes must be an integer between 4 and {MAX_PUBLIC_OUTPUT_BYTES}"
+            )
+        result = self.manager.wait_task(
+            task_id=arguments["task_id"],
+            wait_sec=arguments.get("wait_sec", 30),
+            stdout_offset=arguments.get("stdout_offset", 0),
+            stderr_offset=arguments.get("stderr_offset", 0),
+            max_bytes=max_bytes,
+            include_output=include_output,
+            cancellation_event=cancellation_event,
+        )
+        return compact_task(result, include_output=include_output)
+
+    # ==========================================
     # Function: Dispatch one named MCP tool to its typed manager operation.
-    # Method: Extract schema-backed arguments and normalize configuration/runtime failures.
+    # Method: Keep legacy RPC names callable while exposing only the compact public surface.
     # ==========================================
     def call_tool(
         self,
@@ -395,8 +438,39 @@ class BridgeService:
             return tool_failure("tool arguments must be a JSON object")
         try:
             if name == "list_agents":
-                validate_tool_arguments(arguments, set())
-                return tool_success(self.list_agents())
+                validate_tool_arguments(arguments, set(), {"detail", "refresh"})
+                refresh = arguments.get("refresh", False)
+                detail = arguments.get("detail", False)
+                if not isinstance(refresh, bool) or not isinstance(detail, bool):
+                    raise TaskError("detail and refresh must be booleans")
+                if refresh:
+                    self.reload_config()
+                return tool_success(self.list_agents(detail=detail))
+            if name == "run_agent":
+                return tool_success(self.run_agent(arguments))
+            if name == "task_status":
+                return tool_success(self.task_status(arguments, cancellation_event))
+            if name == "list_tasks":
+                validate_tool_arguments(arguments, set(), {"limit", "statuses", "detail"})
+                statuses = arguments.get("statuses")
+                if statuses is not None and (
+                    not isinstance(statuses, list)
+                    or not all(isinstance(item, str) for item in statuses)
+                ):
+                    raise TaskError("statuses must be a string array")
+                detail = arguments.get("detail", False)
+                if not isinstance(detail, bool):
+                    raise TaskError("detail must be a boolean")
+                result = self.manager.list_tasks(
+                    limit=arguments.get("limit", 10),
+                    statuses=statuses,
+                )
+                return tool_success(compact_task_list(result, detail=detail))
+            if name == "cancel_task":
+                validate_tool_arguments(arguments, {"task_id"})
+                return tool_success(compact_task(self.manager.cancel_task(arguments["task_id"])))
+
+            # Compatibility handlers are intentionally omitted from tools/list.
             if name == "reload_config":
                 validate_tool_arguments(arguments, set())
                 return tool_success(self.reload_config())
@@ -414,9 +488,9 @@ class BridgeService:
                 )
                 return tool_success(
                     self.manager.start_task(
-                        alias=arguments.get("agent"),
-                        prompt=arguments.get("prompt"),
-                        cwd=arguments.get("cwd"),
+                        alias=arguments["agent"],
+                        prompt=arguments["prompt"],
+                        cwd=arguments["cwd"],
                         extra_args=arguments.get("extra_args"),
                         timeout_sec=arguments.get("timeout_sec"),
                         model=arguments.get("model"),
@@ -432,8 +506,8 @@ class BridgeService:
                 )
                 return tool_success(
                     self.manager.send_followup(
-                        parent_task_id=arguments.get("parent_task_id"),
-                        prompt=arguments.get("prompt"),
+                        parent_task_id=arguments["parent_task_id"],
+                        prompt=arguments["prompt"],
                         extra_args=arguments.get("extra_args"),
                         timeout_sec=arguments.get("timeout_sec"),
                     )
@@ -446,10 +520,11 @@ class BridgeService:
                 )
                 return tool_success(
                     self.manager.get_task(
-                        task_id=arguments.get("task_id"),
+                        task_id=arguments["task_id"],
                         stdout_offset=arguments.get("stdout_offset", 0),
                         stderr_offset=arguments.get("stderr_offset", 0),
                         max_bytes=arguments.get("max_bytes", 65536),
+                        include_output=True,
                     )
                 )
             if name == "wait_task":
@@ -460,31 +535,15 @@ class BridgeService:
                 )
                 return tool_success(
                     self.manager.wait_task(
-                        task_id=arguments.get("task_id"),
+                        task_id=arguments["task_id"],
                         wait_sec=arguments.get("wait_sec", 30),
                         stdout_offset=arguments.get("stdout_offset", 0),
                         stderr_offset=arguments.get("stderr_offset", 0),
                         max_bytes=arguments.get("max_bytes", 65536),
+                        include_output=True,
                         cancellation_event=cancellation_event,
                     )
                 )
-            if name == "list_tasks":
-                validate_tool_arguments(arguments, set(), {"limit", "statuses"})
-                statuses = arguments.get("statuses")
-                if statuses is not None and (
-                    not isinstance(statuses, list)
-                    or not all(isinstance(item, str) for item in statuses)
-                ):
-                    raise TaskError("statuses must be a string array")
-                return tool_success(
-                    self.manager.list_tasks(
-                        limit=arguments.get("limit", 20),
-                        statuses=statuses,
-                    )
-                )
-            if name == "cancel_task":
-                validate_tool_arguments(arguments, {"task_id"})
-                return tool_success(self.manager.cancel_task(arguments.get("task_id")))
             return tool_failure(f"unknown tool {name!r}")
         except (ConfigError, TaskError) as exc:
             return tool_failure(str(exc))
@@ -556,7 +615,7 @@ class MCPServer:
         if value.get("method") != "tools/call":
             return False
         params = value.get("params")
-        return isinstance(params, dict) and params.get("name") == "wait_task"
+        return isinstance(params, dict) and params.get("name") in {"task_status", "wait_task"}
 
     # ==========================================
     # Function: Emit one complete JSON-RPC response without cross-thread interleaving.

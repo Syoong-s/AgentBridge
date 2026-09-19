@@ -23,8 +23,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Agent Bridge",
-    "shortDescription": "Orchestrate configured external agent CLIs",
-    "longDescription": "Start linked external child-agent tasks in locally installed command-line tools such as Claude Code or Antigravity CLI. Select provider models and reasoning effort, wait for bounded output, resume supported conversations, or cancel work through commands controlled by a JSON parameter file.",
+    "shortDescription": "Run explicitly requested external agent CLIs",
+    "longDescription": "Run explicitly requested local external-agent CLIs with bounded task status, optional output, follow-ups, and cancellation.",
     "developerName": "Syoong-s",
     "category": "Developer Tools",
     "capabilities": [
@@ -33,9 +33,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Use $agent-bridge to list configured agents and delegate a task.",
-      "Ask a configured external agent to review this repository.",
-      "Check the status and output of my Agent Bridge tasks."
+      "Use $agent-bridge only when the user explicitly asks to run or consult a configured external agent.",
+      "Use run_agent for launch or follow-up and task_status for compact progress."
     ],
     "brandColor": "#7C3AED"
   }

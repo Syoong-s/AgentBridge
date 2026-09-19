@@ -1281,9 +1281,12 @@ class TaskManager:
         stdout_offset: int = 0,
         stderr_offset: int = 0,
         max_bytes: int = 65536,
+        include_output: bool = True,
     ) -> dict[str, Any]:
         if not isinstance(task_id, str) or TASK_ID_PATTERN.fullmatch(task_id) is None:
             raise TaskError("task_id must be a valid string identifier")
+        if not isinstance(include_output, bool):
+            raise TaskError("include_output must be a boolean")
         with self._lock:
             record = self._tasks.get(task_id)
             if record is None:
@@ -1291,12 +1294,13 @@ class TaskManager:
             public = self._public_record(record)
             task_dir = self._task_dir(task_id)
             stream_complete = record.status in TERMINAL_STATUSES
-            public["stdout"] = self._read_log(
-                task_dir / "stdout.log", stdout_offset, max_bytes, stream_complete
-            )
-            public["stderr"] = self._read_log(
-                task_dir / "stderr.log", stderr_offset, max_bytes, stream_complete
-            )
+            if include_output:
+                public["stdout"] = self._read_log(
+                    task_dir / "stdout.log", stdout_offset, max_bytes, stream_complete
+                )
+                public["stderr"] = self._read_log(
+                    task_dir / "stderr.log", stderr_offset, max_bytes, stream_complete
+                )
             return public
 
     # ==========================================
@@ -1310,10 +1314,13 @@ class TaskManager:
         stdout_offset: int = 0,
         stderr_offset: int = 0,
         max_bytes: int = 65536,
+        include_output: bool = True,
         cancellation_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if isinstance(wait_sec, bool) or not isinstance(wait_sec, int) or not 0 <= wait_sec <= 50:
             raise TaskError("wait_sec must be an integer between 0 and 50")
+        if not isinstance(include_output, bool):
+            raise TaskError("include_output must be a boolean")
         if not isinstance(task_id, str) or TASK_ID_PATTERN.fullmatch(task_id) is None:
             raise TaskError("task_id must be a valid string identifier")
         if cancellation_event is not None and cancellation_event.is_set():
@@ -1324,11 +1331,17 @@ class TaskManager:
                 raise TaskError(f"unknown task_id {task_id!r}")
             event = record.changed
             baseline_sequence = record.change_sequence
-        snapshot = self.get_task(task_id, stdout_offset, stderr_offset, max_bytes)
+        snapshot = self.get_task(task_id, stdout_offset, stderr_offset, max_bytes, include_output)
+        baseline_status = snapshot["status"]
         if (
             snapshot["status"] in TERMINAL_STATUSES
-            or snapshot["stdout"]["next_offset"] > snapshot["stdout"]["offset"]
-            or snapshot["stderr"]["next_offset"] > snapshot["stderr"]["offset"]
+            or (
+                include_output
+                and (
+                    snapshot["stdout"]["next_offset"] > snapshot["stdout"]["offset"]
+                    or snapshot["stderr"]["next_offset"] > snapshot["stderr"]["offset"]
+                )
+            )
             or wait_sec == 0
         ):
             return snapshot
@@ -1338,10 +1351,12 @@ class TaskManager:
                 raise TaskError("wait request was cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return self.get_task(task_id, stdout_offset, stderr_offset, max_bytes)
+                return self.get_task(task_id, stdout_offset, stderr_offset, max_bytes, include_output)
             with self._lock:
-                if record.change_sequence != baseline_sequence:
-                    return self.get_task(task_id, stdout_offset, stderr_offset, max_bytes)
+                changed = record.change_sequence != baseline_sequence
+                status_changed = record.status != baseline_status
+                if (include_output and changed) or (not include_output and status_changed):
+                    return self.get_task(task_id, stdout_offset, stderr_offset, max_bytes, include_output)
                 event.clear()
             interval = min(remaining, 0.1) if cancellation_event is not None else remaining
             event.wait(interval)

@@ -20,6 +20,7 @@ CLI flag 被误当成提示词。
 - 支持参数、stdin、临时提示词文件三种传递模式；
 - 支持异步任务、进度感知的并发等待、分页日志和持久化元数据；
 - 支持父任务/根任务关系、provider 会话续接和 follow-up；
+- 提供五个公开 MCP 工具，默认返回紧凑状态，并按需读取日志；
 - 支持并发限制、超时、POSIX 进程组取消和服务重启恢复；
 - 支持工作目录白名单、别名级环境变量和额外参数策略；
 - 仅使用 Python 标准库，无需安装第三方包。
@@ -122,10 +123,9 @@ cp plugins/agent-bridge/config/agents.example.json \
 或提示词文件参数之前。省略 `allowed_values` 表示允许任意有长度上限的字符串，适合
 经常更新的模型目录。
 
-Codex 通过 `start_child_agent`（或兼容的 `start_task`）的 `model` 和
-`reasoning_effort` 字段指定它们。调用时省略某个值会采用别名内的 `default`；没有默认
-值时则完全不传对应 provider 参数。未配置某类映射的 CLI 会明确拒绝该运行时参数，
-不会静默忽略。
+Codex 通过 `run_agent` 的 `model` 和 `reasoning_effort` 字段指定它们。调用时省略
+某个值会采用别名内的 `default`；没有默认值时则完全不传对应 provider 参数。未配置
+某类映射的 CLI 会明确拒绝该运行时参数，不会静默忽略。
 
 任务元数据记录的是 AgentBridge 解析出的选择值，不是 provider 对实际执行模型的独立
 证明。启用 `allow_extra_args` 后，调用方不应再附加冲突的模型或 effort 参数；重复参数
@@ -142,21 +142,22 @@ Codex 通过 `start_child_agent`（或兼容的 `start_task`）的 `model` 和
   `resume_arguments`。Antigravity 别名用 `--output-format json` 返回
   `conversation_id`，并用 `--conversation` 续接。
 
-`send_followup` 会新建一个持久化子任务，同时复用 provider 会话，并继承别名、工作
-目录、模型、思考等级、超时和根任务关系。为避免同一会话损坏，只能续接该会话最新的
-终态任务，而且同一时刻只允许该会话存在一个活动任务。
+`run_agent` 传入 `resume_task_id` 时，会新建一个持久化子任务，同时复用 provider 会话，
+并继承别名、工作目录、模型、思考等级、超时和根任务关系。为避免同一会话损坏，只能
+续接该会话最新的终态任务，而且同一时刻只允许该会话存在一个活动任务。
 
 参数模式下，提示词可能出现在系统进程列表中；敏感任务优先使用 stdin 或文件模式。
 如果某个 CLI 必须使用管道、重定向或其他 shell 语法，请把这些逻辑写进经过审查的
 可执行包装脚本，再把脚本路径配置为 `command[0]`。AgentBridge 不会把命令字符串交给
 shell。
 
-修改活动参数文件后，让 Codex 调用 `reload_config`。已经运行的任务继续使用启动时的
-配置快照；修改状态目录需要重启 MCP server。
+修改活动参数文件后，调用 `list_agents` 并传入 `refresh=true`。已经运行的任务继续使用
+启动时的配置快照。旧的 `reload_config` RPC 仍为兼容保留，但不会出现在工具列表中；修改
+状态目录需要重启 MCP server。
 
 ## 在 Codex 中使用
 
-例如：
+仅当用户明确要求运行、咨询或委派给已配置的外部 agent 时使用本插件。例如：
 
 ```text
 使用 $agent-bridge，让 Claude Code 以 opus 模型和 high 思考等级审查当前仓库，
@@ -168,38 +169,39 @@ shell。
 检查 diff 并在本地验证。
 ```
 
-插件提供以下 MCP 工具：
+公开 MCP 工具刻意保持为五个：
 
 | 工具 | 用途 |
 | --- | --- |
-| `list_agents` | 查看别名、限制、提示词模式和可执行文件可用性 |
-| `reload_config` | 重新验证活动参数文件并供后续任务使用 |
-| `start_child_agent` | 用模型、思考等级和可选父任务启动外部子智能体 |
-| `start_task` | `start_child_agent` 的向后兼容别名 |
-| `send_followup` | 续接最新 provider 会话，生成新的关联子任务 |
-| `get_task` | 不等待，读取当前元数据和分页输出 |
-| `wait_task` | 在出现未读输出、进度/完成、取消或最长 50 秒到期时返回 |
-| `list_tasks` | 列出最近任务，可按状态过滤 |
+| `list_agents` | 列出紧凑的别名可用性；诊断时使用 `detail=true`，修改配置后使用 `refresh=true` |
+| `run_agent` | 用 `agent`、`prompt`、`cwd` 启动任务，或用 `resume_task_id`、`prompt` 续接任务 |
+| `task_status` | 等待生命周期变化；除非传入 `include_output=true`，否则不返回日志 |
+| `list_tasks` | 列出紧凑的近期任务元数据；仅诊断时使用 `detail=true` |
 | `cancel_task` | 幂等取消一个活动进程组 |
 
-任务状态包括 `queued`、`running`、`cancelling`、`succeeded`、`failed`、
-`timed_out`、`cancelled` 和 `interrupted`。`succeeded` 表示进程返回码为零，而且必要的
-输出捕获和终态元数据持久化均正常完成；Codex 仍需核实重要结论和工作区改动。
-若出现 `persistence_error`，说明终态元数据写入失败，内存中的结果已保守地改为
-`failed`。
+`run_agent` 返回任务 ID 和紧凑的启动元数据。任务运行期间，用有限的 `wait_sec` 调用
+`task_status`；默认响应不包含 stdout/stderr。需要输出时显式设置 `include_output=true`，
+使用返回的字节偏移继续分页，并将 `max_bytes` 保持在上限内（公开接口每个流最多 16 KiB）。
+不读取输出的等待只在生命周期变化时唤醒，不会因每次日志写入反复增长上下文。
 
-每个任务都会报告 `task_kind: external_child_agent`、`parent_task_id`、
-`root_task_id`、`child_task_ids`、`invocation`、桥接层解析的 `model`/
-`reasoning_effort`，以及 provider 支持时的 `session_id`。Codex 因此可以重建外部委派
-树，同时不会把它误报为原生 Codex agent 线程树。
+旧的 `reload_config`、`start_child_agent`、`start_task`、`send_followup`、`get_task` 和
+`wait_task` RPC 仍作为服务端兼容别名保留，但会从 `tools/list` 中隐藏，使正常模型上下文
+只包含精简后的公开接口。
 
-输出按字节偏移分页；当 `has_more` 为 true 时继续使用该流的 `next_offset`。出现
-运行中任务的 `incomplete_utf8_tail` 为 true 时，应等待外部进程写完多字节字符后再读。
-出现 `stdout_truncated` 或 `stderr_truncated` 表示达到了配置的存储上限。
+任务状态包括 `queued`、`running`、`cancelling`、`succeeded`、`failed`、`timed_out`、
+`cancelled` 和 `interrupted`。`succeeded` 表示进程返回码为零，而且必要的输出捕获和终态
+元数据持久化均正常完成；Codex 仍需核实重要结论和工作区改动。若出现 `persistence_error`，
+说明终态元数据写入失败，内存中的结果已保守地改为 `failed`。
 
-当出现输出或其他任务变化时，`wait_task` 可以在任务进入终态前返回。后续调用应复用
-两个流返回的 `next_offset`，并在状态仍非终态时继续等待。MCP
-`notifications/cancelled` 只停止对应的等待响应，不会终止持久存在的外部任务；如需
+完整任务记录仍保留 `task_kind: external_child_agent`、`parent_task_id`、`root_task_id`、
+`child_task_ids`、`invocation`、桥接层解析的 `model`/`reasoning_effort`，以及 provider 支持
+时的 `session_id`。仅在诊断或审计时请求这些字段，避免每次状态轮询都带上它们。
+
+输出按字节偏移分页；当 `has_more` 为 true 时继续使用该流的 `next_offset`。出现运行中任务的
+`incomplete_utf8_tail` 时，应等待外部进程写完多字节字符后再读。出现 `stdout_truncated` 或
+`stderr_truncated` 表示达到了配置的存储上限。
+
+MCP `notifications/cancelled` 只停止对应的等待响应，不会终止持久存在的外部任务；如需
 结束 provider 进程，应显式调用 `cancel_task`。
 
 ## 状态与安全边界

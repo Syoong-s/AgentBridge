@@ -21,6 +21,7 @@ flag is not consumed as the prompt.
 - argument, stdin, and temporary prompt-file transport modes;
 - asynchronous tasks with progress-aware concurrent waits, paginated logs, and persistent metadata;
 - parent/root task lineage plus resumable provider sessions and follow-up turns;
+- a five-tool public MCP surface with compact status responses and opt-in log output;
 - concurrency limits, timeouts, cancellation of isolated POSIX process groups, and
   restart recovery;
 - optional working-directory allowlists and per-alias environment/extra-argument policy;
@@ -169,10 +170,9 @@ prompt/prompt-file argument. Omitting `allowed_values` permits any bounded strin
 is useful for provider model catalogs that change over time.
 
 Codex supplies these through the `model` and `reasoning_effort` fields of
-`start_child_agent` (or the compatible `start_task`). If Codex omits a value, AgentBridge
-uses the alias `default`; if there is no default, that provider flag is omitted. A CLI
-without the corresponding mapping rejects that runtime selector instead of silently
-ignoring it.
+`run_agent`. If Codex omits a value, AgentBridge uses the alias `default`; if there is no
+default, that provider flag is omitted. A CLI without the corresponding mapping rejects
+that runtime selector instead of silently ignoring it.
 
 The task metadata records the selector resolved by AgentBridge, not an independent
 provider attestation. When `allow_extra_args` is enabled, callers must not append
@@ -191,23 +191,25 @@ behave.
   alias uses `--output-format json`, extracts `conversation_id`, and resumes with
   `--conversation`.
 
-`send_followup` starts a new persisted child task while reusing the provider session.
-It inherits the alias, working directory, selected model/effort, timeout, and root
-lineage. To prevent session corruption, only the latest terminal task in a session can
-be continued, and only one task in that session may be active.
+A `run_agent` call with `resume_task_id` starts a new persisted child task while reusing
+the provider session. It inherits the alias, working directory, selected model/effort,
+timeout, and root lineage. To prevent session corruption, only the latest terminal task
+in a session can be continued, and only one task in that session may be active.
 
 Use argument mode only when process-list visibility is acceptable. Prefer stdin or file
 mode for sensitive prompts. If a CLI needs pipes, redirection, or other shell syntax,
 put that logic in a reviewed executable wrapper script and configure its path as
 `command[0]`; AgentBridge intentionally never turns a command string into a shell.
 
-After editing the active file, ask Codex to call `reload_config`. Running tasks keep the
-validated configuration snapshot with which they started. Changing the state directory
+After editing the active file, call `list_agents` with `refresh=true`. Running tasks keep
+the validated configuration snapshot with which they started. The older `reload_config`
+RPC remains available for compatibility but is not advertised. Changing the state directory
 requires restarting the MCP server.
 
 ## Use from Codex
 
-Example requests:
+Use the plugin only when the user explicitly asks to run, consult, or delegate to a
+configured external agent. Example requests:
 
 ```text
 Use $agent-bridge to ask Claude Code with model opus and reasoning effort high to review
@@ -219,19 +221,26 @@ Use $agent-bridge with my antigravity alias to implement the requested change in
 working directory, then inspect and verify its edits locally.
 ```
 
-The skill guides Codex through these MCP tools:
+The public MCP surface is intentionally small:
 
 | Tool | Purpose |
 | --- | --- |
-| `list_agents` | Inspect aliases, limits, prompt modes, and executable availability |
-| `reload_config` | Validate the active file and replace configuration for future tasks |
-| `start_child_agent` | Launch an external child-agent task with model, effort, and optional lineage |
-| `start_task` | Backward-compatible alias of `start_child_agent` |
-| `send_followup` | Resume the latest provider session as a new linked child task |
-| `get_task` | Read current metadata and paginated output without waiting |
-| `wait_task` | Return on unread output/progress/completion, cancellation, or a wait of up to 50 seconds |
-| `list_tasks` | List recent task metadata, optionally filtered by status |
+| `list_agents` | List compact alias availability; use `detail=true` for diagnostics or `refresh=true` after configuration changes |
+| `run_agent` | Start a task with `agent`, `prompt`, and `cwd`, or resume one with `resume_task_id` and `prompt` |
+| `task_status` | Wait for lifecycle changes; logs are omitted unless `include_output=true` |
+| `list_tasks` | List recent compact task metadata; use `detail=true` only for diagnostics |
 | `cancel_task` | Idempotently cancel one active process group |
+
+`run_agent` returns a task ID and compact launch metadata. While the task runs, call
+`task_status` with a bounded `wait_sec`; its default response contains no stdout/stderr.
+When output is needed, set `include_output=true`, use the returned byte offsets for
+pagination, and keep `max_bytes` bounded (the public maximum is 16 KiB per stream).
+A `task_status` wait without output wakes on lifecycle changes rather than every log write,
+which avoids repeated context growth.
+
+The older `reload_config`, `start_child_agent`, `start_task`, `send_followup`, `get_task`,
+and `wait_task` RPC names remain server-side compatibility aliases, but are intentionally
+omitted from `tools/list` so normal model context contains only the compact surface.
 
 Task states are `queued`, `running`, `cancelling`, `succeeded`, `failed`, `timed_out`,
 `cancelled`, and `interrupted`. `succeeded` means the process returned zero and required
@@ -239,21 +248,19 @@ output capture plus terminal metadata persistence completed normally; Codex stil
 verify consequential claims and workspace edits. A `persistence_error` value explains a
 terminal metadata failure that conservatively changed the in-memory result to `failed`.
 
-Every task reports `task_kind: external_child_agent`, `parent_task_id`, `root_task_id`,
-`child_task_ids`, `invocation`, bridge-resolved `model`/`reasoning_effort`, and `session_id`
-when supported. These fields let Codex reconstruct the external delegation tree without
-misrepresenting it as a native Codex agent-thread tree.
+Detailed task records retain `task_kind: external_child_agent`, `parent_task_id`,
+`root_task_id`, `child_task_ids`, `invocation`, bridge-resolved `model`/`reasoning_effort`,
+and `session_id` when supported. Request them only for diagnosis or auditing rather than
+including them in every status poll.
 
 Output is paginated by byte offsets. Follow each stream's `next_offset` while `has_more`
 is true. On a running task, `incomplete_utf8_tail` asks the caller to wait until the
 external process emits the rest of a multibyte character. A `stdout_truncated` or
 `stderr_truncated` flag means the configured storage ceiling was reached.
 
-`wait_task` can return before terminal completion when output or another task change is
-available. Reuse both returned `next_offset` values and call it again while status remains
-nonterminal. MCP `notifications/cancelled` stops only the matching in-flight wait response;
-it deliberately leaves the durable external task running. Use `cancel_task` when the
-provider process itself should be terminated.
+MCP `notifications/cancelled` stops only the matching in-flight wait response; it
+deliberately leaves the durable external task running. Use `cancel_task` when the provider
+process itself should be terminated.
 
 ## State and security
 
